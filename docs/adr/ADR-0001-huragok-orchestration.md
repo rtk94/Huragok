@@ -8,6 +8,7 @@
 **Revision history:**
 - 2026-04-21 — Initial Accepted version.
 - 2026-04-21 — Renumbered downstream ADRs: inserted ADR-0002 (orchestrator daemon internals) per in-repo review; former 0002–0006 shifted to 0003–0007.
+- 2026-04-21 — D3 roster reconciled with ADR-0003: Orchestrator agent collapsed into the Python Supervisor; roster shrinks to five Claude Code agents (Architect, Implementer, TestWriter, Critic, Documenter). Critic model assignment upgraded from Sonnet to Opus to reflect its final-judgment authority.
 
 ## Context
 
@@ -62,16 +63,15 @@ Agents read and write these files. They do not pass structured data through the 
 
 ### D3. Agent roster (summary; full definitions in ADR-0003)
 
-Six roles, each a file under `.claude/agents/` with a crisp system prompt, tool allowlist, and model assignment:
+**Session coordination — reading state, sequencing roles, dispatching sessions — is handled by the Python Supervisor (ADR-0002 D1). It is not itself a Claude Code agent.** The five Claude Code agents below each execute in their own session, launched by the Supervisor:
 
-- **Orchestrator** — the in-session coordinator. Reads `state.yaml`, dispatches work via Task, moves tasks through the state machine, writes back to `state.yaml`. Opus. Task tool plus file I/O.
 - **Architect** — produces `spec.md` from a batch entry. Single invocation per task. Sets the `foundational` flag. Opus. No write access outside the task folder. Dual-mode: backend architecture and UI/UX specification, selected by the batch entry.
 - **Implementer** — consumes `spec.md`, writes code, writes `implementation.md`. Duplicatable; N parallel instances run in separate git worktrees on independent tasks. Sonnet. Full code-write access within its worktree.
 - **TestWriter** — consumes `spec.md` and `implementation.md`, writes tests, writes `tests.md`. Runs mutation testing and records survival rate. Sonnet.
-- **Critic** — consumes all of the above, executes tests, inspects mutation results, drives Playwright for UI flows, writes `review.md` with pass / fail / block. Authority to mark a task `software-complete` or `blocked`. Sonnet with read-heavy toolset; no code-write access outside review artifacts.
-- **Documenter** — post-merge only. Updates user-facing docs when features reach `done`. Haiku or Sonnet. Scoped to docs paths.
+- **Critic** — consumes all of the above, executes tests, inspects mutation results, drives Playwright for UI flows, writes `review.md` with pass / fail / block. Authority to mark a task `software-complete` or `blocked`. Opus with read-heavy toolset; no code-write access outside review artifacts.
+- **Documenter** — post-merge only. Updates user-facing docs when features reach `done`. Haiku. Scoped to docs paths.
 
-The collapses relative to the original eight-role vision — PM into Orchestrator, Tester + Reviewer into Critic, UX Designer into Architect mode flag — are motivated by coordination-cost concerns documented in ADR-0003.
+The collapses relative to the original eight-role vision — PM into Supervisor (out-of-session), Tester + Reviewer into Critic, UX Designer into Architect mode flag — are motivated by coordination-cost concerns documented in ADR-0003.
 
 ### D4. Budget enforcement is the orchestrator's job
 
@@ -84,7 +84,7 @@ The orchestrator enforces four independent budgets on every run:
 
 Any budget crossing its threshold halts session launches, completes the in-flight session gracefully, writes a halt summary to `state.yaml`, and dispatches a notification. The operator decides what to do next. The orchestrator never raises its own budget.
 
-`CLAUDE_CODE_SUBAGENT_MODEL` is set on every session launch so worker subagents default to Sonnet while the Orchestrator agent runs on Opus. This is the single largest cost lever in the system.
+`CLAUDE_CODE_SUBAGENT_MODEL` is set on every session launch so worker sessions default to Sonnet while the Architect and Critic sessions run on Opus. This is the single largest cost lever in the system.
 
 ### D5. Notifications are actionable, not decorative
 
@@ -156,7 +156,7 @@ Distributability is an explicit goal: Huragok should be installable by someone w
 **Negative:**
 
 - Two systems to maintain (Python orchestrator, Claude Code agent definitions).
-- File-based state discipline requires Orchestrator agent prompts that consistently read/write correctly; drift here will be the most likely failure mode in practice.
+- File-based state discipline requires agent prompts that consistently read/write state correctly; drift here will be the most likely failure mode in practice.
 - The foundational-task UI gate means some batches will still halt awaiting operator review. This is intentional and scoped.
 - Worktree-based parallelism (ADR-0005) will require careful handling of shared dependencies and integration testing.
 - Tier-1 secret management is adequate but loose; the upgrade to tier 2 needs to happen before any exposure increase.
