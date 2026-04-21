@@ -1,0 +1,31 @@
+version: 1
+batch_id: batch-001
+created: 2026-04-21T09:00:00Z
+description: "Test batch for Huragok unit tests"
+budgets:
+  wall_clock_hours: 12.0
+  max_tokens: 5000000
+  max_dollars: 50.0
+  max_iterations: 2
+  session_timeout_minutes: 45
+notifications:
+  telegram_chat_id: null
+  warn_threshold_pct: 80
+tasks:
+  - id: task-example
+    title: "Add /healthz endpoint"
+    kind: backend
+    priority: 1
+    acceptance_criteria:
+      - "GET /healthz returns 200"
+    depends_on: []
+    foundational: false
+  - id: task-0001
+    title: "Add user preferences endpoint"
+    kind: backend
+    priority: 2
+    acceptance_criteria:
+      - "GET /api/preferences returns 200 with current user's prefs"
+      - "PATCH /api/preferences updates prefs and persists to DB"
+    depends_on: []
+    foundational: false

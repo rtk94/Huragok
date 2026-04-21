@@ -1,0 +1,41 @@
+version: 1
+task_id: task-example
+state: done
+foundational: false
+history:
+  - at: 2026-04-21T09:02:11Z
+    from: pending
+    to: speccing
+    by: supervisor
+    session_id: null
+  - at: 2026-04-21T09:15:00Z
+    from: speccing
+    to: implementing
+    by: architect
+    session_id: 01HXYZ0000000000000000ARCH
+  - at: 2026-04-21T09:42:00Z
+    from: implementing
+    to: testing
+    by: implementer
+    session_id: 01HXYZ0000000000000000IMPL
+  - at: 2026-04-21T10:02:00Z
+    from: testing
+    to: reviewing
+    by: testwriter
+    session_id: 01HXYZ0000000000000000TEST
+  - at: 2026-04-21T10:12:00Z
+    from: reviewing
+    to: software-complete
+    by: critic
+    session_id: 01HXYZ0000000000000000CRIT
+  - at: 2026-04-21T10:12:10Z
+    from: software-complete
+    to: done
+    by: supervisor
+    session_id: null
+blockers: []
+ui_review:
+  required: false
+  screenshots: []
+  preview_url: null
+  resolved: null

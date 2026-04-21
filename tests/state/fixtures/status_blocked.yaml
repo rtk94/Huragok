@@ -1,0 +1,27 @@
+version: 1
+task_id: task-0002
+state: blocked
+foundational: false
+history:
+  - at: 2026-04-21T09:02:11Z
+    from: pending
+    to: speccing
+    by: supervisor
+    session_id: null
+  - at: 2026-04-21T09:30:00Z
+    from: speccing
+    to: implementing
+    by: architect
+    session_id: 01HXYZ0000000000000000ARC2
+  - at: 2026-04-21T10:10:00Z
+    from: implementing
+    to: blocked
+    by: critic
+    session_id: 01HXYZ0000000000000000CRI2
+blockers:
+  - "Upstream schema change required; see task-0001 open questions"
+ui_review:
+  required: false
+  screenshots: []
+  preview_url: null
+  resolved: null

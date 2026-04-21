@@ -1,0 +1,22 @@
+version: 1
+phase: zooming
+batch_id: null
+session_count: 0
+budget_consumed:
+  wall_clock_seconds: 0.0
+  tokens_input: 0
+  tokens_output: 0
+  tokens_cache_read: 0
+  tokens_cache_write: 0
+  dollars: 0.0
+  iterations: 0
+session_budget:
+  remaining_tokens: null
+  remaining_dollars: null
+  timeout_seconds: null
+pending_notifications: []
+awaiting_reply:
+  notification_id: null
+  sent_at: null
+  kind: null
+  deadline: null

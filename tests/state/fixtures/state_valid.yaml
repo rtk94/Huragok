@@ -1,0 +1,28 @@
+version: 1
+phase: running
+batch_id: batch-001
+current_task: task-0001
+current_agent: implementer
+session_count: 3
+session_id: 01HXYZ8JKQABCDEFGHJKMNPQRS
+started_at: 2026-04-21T09:00:00Z
+last_checkpoint: 2026-04-21T11:15:00Z
+halted_reason: null
+budget_consumed:
+  wall_clock_seconds: 8100.0
+  tokens_input: 500000
+  tokens_output: 300000
+  tokens_cache_read: 100000
+  tokens_cache_write: 50000
+  dollars: 5.50
+  iterations: 0
+session_budget:
+  remaining_tokens: 4000000
+  remaining_dollars: 40.0
+  timeout_seconds: 2700
+pending_notifications: []
+awaiting_reply:
+  notification_id: null
+  sent_at: null
+  kind: null
+  deadline: null

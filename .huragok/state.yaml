@@ -1,33 +1,40 @@
 # Huragok — Orchestrator State
 #
-# This file is owned by the orchestrator. Agents inside a Claude Code session
-# may READ it to know where they are in the batch; the orchestrator is the
-# only component that WRITES it.
+# This file is owned by the orchestrator daemon. Agents inside a Claude
+# Code session may READ it to know where they are in the batch; the
+# orchestrator is the only component that WRITES it.
 #
-# This file is currently empty. It will be populated automatically when the
-# orchestrator starts a batch.
+# The values below represent the "idle, no batch in flight" state and
+# validate cleanly against the Slice A schemas. When `huragok run`
+# launches a batch, the Supervisor overwrites this file with live state.
 #
-# ---
-# Example (reference only):
-#
-# version: 1
-# batch_id: batch-001
-# phase: running          # idle | running | paused | halted | complete
-# current_task: task-0002
-# current_agent: implementer
-# session_count: 7
-# started_at: 2026-04-21T09:00:00Z
-# last_checkpoint: 2026-04-21T13:42:11Z
-# budget_consumed:
-#   wall_clock_hours: 4.7
-#   tokens: 1_823_441
-#   dollars: 18.92
-#   iterations: 0
-# pending_notifications: []
-# last_notification:
-#   sent_at: 2026-04-21T13:00:00Z
-#   kind: progress
-#   reply: null
+# Schema: orchestrator.state.schemas.StateFile (ADR-0002 D3)
 
+version: 1
 phase: idle
 batch_id: null
+current_task: null
+current_agent: null
+session_count: 0
+session_id: null
+started_at: null
+last_checkpoint: null
+halted_reason: null
+budget_consumed:
+  wall_clock_seconds: 0
+  tokens_input: 0
+  tokens_output: 0
+  tokens_cache_read: 0
+  tokens_cache_write: 0
+  dollars: 0.0
+  iterations: 0
+session_budget:
+  remaining_tokens: null
+  remaining_dollars: null
+  timeout_seconds: null
+pending_notifications: []
+awaiting_reply:
+  notification_id: null
+  sent_at: null
+  kind: null
+  deadline: null

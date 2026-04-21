@@ -18,9 +18,14 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
 ]
 
-# Runtime dependencies will be added as the orchestrator takes shape in Phase 1.
-# Expected near-term additions: pydantic, pyyaml, httpx, structlog, typer.
-dependencies = []
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyyaml>=6.0",
+    "structlog>=24.0",
+    "typer>=0.12",
+    "rich>=13.0",
+]
 
 [project.optional-dependencies]
 dev = []
@@ -30,9 +35,8 @@ Homepage = "https://github.com/rknepp/huragok"
 Repository = "https://github.com/rknepp/huragok"
 Issues = "https://github.com/rknepp/huragok/issues"
 
-# The CLI entrypoint will be wired up when the orchestrator module exists.
-# [project.scripts]
-# huragok = "orchestrator.cli:main"
+[project.scripts]
+huragok = "orchestrator.cli:app"
 
 [build-system]
 requires = ["hatchling"]
