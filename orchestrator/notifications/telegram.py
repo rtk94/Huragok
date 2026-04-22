@@ -92,6 +92,21 @@ def normalize_verb(raw: str) -> str | None:
     return REPLY_VERB_ALIASES.get(raw.strip().lower())
 
 
+def _is_bot_start_command(text: str) -> bool:
+    """True for ``/start`` — Telegram's standard first-message command.
+
+    Matches ``/start``, ``/start@botname``, ``/start foo`` and
+    case-insensitive variants. Anything past ``/start`` (payload or
+    mention suffix) is ignored. Other slash commands are not filtered
+    here — only ``/start`` is singled out because Telegram itself
+    surfaces it as the "Start" button in every new bot chat.
+    """
+    first = text.strip().split(maxsplit=1)[0].lower()
+    if first == "/start":
+        return True
+    return first.startswith("/start@")
+
+
 def parse_reply_text(text: str) -> ParsedReply | None:
     """Parse an inbound message body into a :class:`ParsedReply`.
 
@@ -428,6 +443,14 @@ class TelegramDispatcher(NotificationDispatcher):
 
         parsed = parse_reply_text(text)
         if parsed is None:
+            # ``/start`` is the universal first message Telegram sends
+            # when a user opens a new bot chat. It's not a reply attempt
+            # and the INFO log from the smoke test made this look like a
+            # reply failure. Demote to DEBUG under a dedicated event name
+            # so operators filtering logs don't see spurious warnings.
+            if _is_bot_start_command(text):
+                self._log.debug("telegram.bot.initialization", text=text[:120])
+                return
             self._log.info("telegram.reply.invalid_verb", text=text[:120])
             return
 

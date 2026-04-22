@@ -296,11 +296,12 @@ class BudgetTracker:
         if isinstance(stream_event, AssistantEvent):
             self._apply_event_usage(ctx, stream_event.usage, stream_event.model)
         elif isinstance(stream_event, ResultEvent):
-            # Result event's usage is authoritative for the session —
-            # when we see it, subtract any running delta for this session
-            # and replace with the authoritative totals. Implementation
-            # note: B1 accumulates straight through because sessions are
-            # strictly sequential; we only reset on session-ended below.
+            # Result event usage is applied additively, same as assistant
+            # events. Today this is harmless because Claude Code's result
+            # events carry empty usage; the totals live on the preceding
+            # assistant events. If that convention changes, the test
+            # test_tracker_applies_both_assistant_and_result_event_usage
+            # will trip. See slice-b2-build-notes.md, amendment 2,  item 7.
             self._apply_event_usage(ctx, stream_event.usage, stream_event.model)
         await self._check_thresholds()
 

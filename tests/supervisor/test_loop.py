@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -307,6 +308,198 @@ async def test_reachability_transitions_to_paused_and_recovers(
         ]
         assert "dispatcher-unreachable" in kinds
         assert "dispatcher-recovered" in kinds
+
+
+async def test_shutdown_cancels_blocked_dispatcher_within_grace(
+    supervisor_tmp_root: Path,
+) -> None:
+    """Idle-loop shutdown returns within the grace window even with a stuck dispatcher.
+
+    A TelegramDispatcher mid-``getUpdates`` long-poll would otherwise
+    hold :func:`run_supervisor` open until the 25-second Telegram
+    timeout elapses. The supervisor must cancel the dispatcher task
+    rather than waiting on it indefinitely.
+    """
+    import time as _time
+
+    from orchestrator.notifications import Notification, NotificationDispatcher
+
+    class _WedgedDispatcher(NotificationDispatcher):
+        """Dispatcher whose start() never observes the stop event.
+
+        Simulates a ``httpx.AsyncClient.get`` call blocked on the wire
+        — the stop_event is set but the await won't return.
+        """
+
+        def __init__(self) -> None:
+            self._reachable = True
+
+        @property
+        def reachable(self) -> bool:  # type: ignore[override]
+            return self._reachable
+
+        async def send(self, notification: Notification) -> None:
+            pass
+
+        async def start(self, stop_event: asyncio.Event) -> None:
+            # Deliberately ignore stop_event — we want the supervisor to
+            # cancel us, not wait on our own drain.
+            await asyncio.sleep(30.0)
+
+    # Remove batch.yaml so the loop sits in the "waiting for submit"
+    # idle path — the SIGINT-inter-batch case the amendment fixes.
+    (supervisor_tmp_root / ".huragok" / "batch.yaml").unlink()
+
+    settings = HuragokSettings()
+    start = _time.monotonic()
+    loop_task = asyncio.create_task(
+        run_supervisor(
+            root=supervisor_tmp_root,
+            settings=settings,
+            pricing=load_pricing(),
+            claude_binary=str(FAKE_CLAUDE),
+            request_poll_seconds=0.05,
+            dispatcher=_WedgedDispatcher(),
+        )
+    )
+    # Let the loop start and enter its idle sleep.
+    await asyncio.sleep(0.15)
+
+    # Trigger shutdown (same effect as the SIGINT handler setting the
+    # shutting_down event). We reach into signals by writing the
+    # ``stop`` request file, which the loop picks up on its next tick.
+    (supervisor_tmp_root / ".huragok" / "requests" / "stop").write_text("")
+
+    # The loop should return within the grace window (~1s) regardless
+    # of the wedged dispatcher.
+    exit_code = await asyncio.wait_for(loop_task, timeout=3.0)
+    elapsed = _time.monotonic() - start
+    assert exit_code == 0
+    # Startup + idle_sleep (50ms) + shutdown grace (1s) + jitter is well
+    # under 2.5s. Without the cancel, this would be 30s.
+    assert elapsed < 2.5, f"loop took {elapsed:.2f}s to shut down with wedged dispatcher"
+
+
+async def test_loop_transitions_to_complete_when_all_tasks_done(
+    supervisor_tmp_root: Path,
+) -> None:
+    """All tasks terminal → phase=complete + batch-complete audit + clean exit."""
+    from orchestrator.paths import task_dir
+    from orchestrator.state import HistoryEntry, StatusFile, write_status
+
+    # Seed the single batch task as done BEFORE the loop starts.
+    task_dir(supervisor_tmp_root, "task-b1-test").mkdir(parents=True, exist_ok=True)
+    done_status = StatusFile(
+        version=1,
+        task_id="task-b1-test",
+        state="done",
+        foundational=False,
+        history=[
+            HistoryEntry(
+                at=datetime(2026, 4, 22, 10, 0, 0),
+                from_="implementing",
+                to="done",
+                by="test",
+                session_id=None,
+            ),
+        ],
+    )
+    write_status(supervisor_tmp_root, done_status)
+
+    settings = HuragokSettings()
+    exit_code = await asyncio.wait_for(
+        run_supervisor(
+            root=supervisor_tmp_root,
+            settings=settings,
+            pricing=load_pricing(),
+            claude_binary=str(FAKE_CLAUDE),
+            request_poll_seconds=0.05,
+            dispatcher=LoggingDispatcher(root=supervisor_tmp_root, batch_id="batch-001"),
+        ),
+        timeout=10.0,
+    )
+    assert exit_code == 0
+
+    final_state = read_state(supervisor_tmp_root)
+    assert final_state.phase == "complete"
+    # Current-task pointer cleared so the status view isn't confusing.
+    assert final_state.current_task is None
+    assert final_state.current_agent is None
+
+    # Audit entry for batch-complete is present.
+    audit_path = audit_log(supervisor_tmp_root, "batch-001")
+    assert audit_path.exists()
+    events = [json.loads(line) for line in audit_path.read_text().splitlines() if line]
+    kinds = [e.get("kind") for e in events]
+    assert "batch-complete" in kinds
+
+
+async def test_loop_transitions_to_complete_with_blocked_task(
+    supervisor_tmp_root: Path,
+) -> None:
+    """Partial completion (one done, one blocked) still counts as complete."""
+    # Extend the batch to two tasks: one will land `done`, the other
+    # `blocked`. Both are terminal so the daemon should exit.
+    import yaml as _yaml
+
+    from orchestrator.paths import task_dir
+    from orchestrator.state import HistoryEntry, StatusFile, write_status
+
+    batch_path = supervisor_tmp_root / ".huragok" / "batch.yaml"
+    batch = _yaml.safe_load(batch_path.read_text())
+    batch["tasks"].append(
+        {
+            "id": "task-b1-extra",
+            "title": "Second task",
+            "kind": "backend",
+            "priority": 2,
+            "acceptance_criteria": ["irrelevant"],
+            "depends_on": [],
+            "foundational": False,
+        }
+    )
+    batch_path.write_text(_yaml.safe_dump(batch, sort_keys=False))
+
+    now = datetime(2026, 4, 22, 10, 0, 0)
+    for task_id, terminal_state in (
+        ("task-b1-test", "done"),
+        ("task-b1-extra", "blocked"),
+    ):
+        task_dir(supervisor_tmp_root, task_id).mkdir(parents=True, exist_ok=True)
+        write_status(
+            supervisor_tmp_root,
+            StatusFile(
+                version=1,
+                task_id=task_id,
+                state=terminal_state,  # type: ignore[arg-type]
+                foundational=False,
+                history=[
+                    HistoryEntry(
+                        at=now,
+                        from_="implementing",
+                        to=terminal_state,
+                        by="test",
+                        session_id=None,
+                    ),
+                ],
+                blockers=["irrelevant"] if terminal_state == "blocked" else [],
+            ),
+        )
+
+    settings = HuragokSettings()
+    exit_code = await asyncio.wait_for(
+        run_supervisor(
+            root=supervisor_tmp_root,
+            settings=settings,
+            pricing=load_pricing(),
+            claude_binary=str(FAKE_CLAUDE),
+            request_poll_seconds=0.05,
+            dispatcher=LoggingDispatcher(root=supervisor_tmp_root, batch_id="batch-001"),
+        ),
+        timeout=10.0,
+    )
+    assert exit_code == 0
+    assert read_state(supervisor_tmp_root).phase == "complete"
 
 
 async def test_attempt_count_survives_restart(

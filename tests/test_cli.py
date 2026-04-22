@@ -52,6 +52,42 @@ def test_status_outside_huragok_repo(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert "huragok" in result.stderr.lower()
 
 
+def test_status_fresh_huragok_with_no_state_yaml_is_friendly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``.huragok/`` dir without ``state.yaml`` exits 0 with a pointer message."""
+    (tmp_path / ".huragok").mkdir()
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0, result.stderr
+    assert "no batch submitted" in result.stdout.lower()
+    assert "huragok submit" in result.stdout
+
+
+def test_status_json_fresh_huragok_with_no_state_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--json variant returns a minimal shape rather than a traceback."""
+    (tmp_path / ".huragok").mkdir()
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["status", "--json"])
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload.get("phase") == "no-batch"
+    assert payload.get("batch_id") is None
+
+
+def test_tasks_fresh_huragok_with_no_batch_is_friendly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``huragok tasks`` in a fresh ``.huragok/`` exits 0 with a pointer message."""
+    (tmp_path / ".huragok").mkdir()
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["tasks"])
+    assert result.exit_code == 0, result.stderr
+    assert "no batch" in result.stdout.lower()
+
+
 # ---------------------------------------------------------------------------
 # tasks
 # ---------------------------------------------------------------------------
@@ -545,3 +581,42 @@ def test_status_sessions_breakdown(tmp_huragok_root: Path, monkeypatch: pytest.M
     result = runner.invoke(app, ["status"])
     assert result.exit_code == 0, result.stderr
     assert "3 launched, 2 clean, 1 retry" in result.stdout
+
+
+def test_status_exposes_cache_token_sublines(
+    tmp_huragok_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cache tokens render as labelled sub-lines under Tokens:."""
+    # Rewrite state.yaml with nonzero cache counters so the sub-lines
+    # have distinguishable values. Values match the rough shape seen in
+    # the 2026-04-22 smoke-001 run.
+    state_path = tmp_huragok_root / ".huragok" / "state.yaml"
+    state = yaml.safe_load(state_path.read_text())
+    state["budget_consumed"] = {
+        "wall_clock_seconds": 240.0,
+        "tokens_input": 186,
+        "tokens_output": 13_100,
+        "tokens_cache_read": 2_560_000,
+        "tokens_cache_write": 367_000,
+        "dollars": 6.67,
+        "iterations": 0,
+    }
+    state_path.write_text(yaml.safe_dump(state, sort_keys=False))
+
+    monkeypatch.chdir(tmp_huragok_root)
+    result = runner.invoke(app, ["status"])
+    assert result.exit_code == 0, result.stderr
+
+    # The four sub-lines must each be present.
+    assert "input:" in result.stdout
+    assert "output:" in result.stdout
+    assert "cache read:" in result.stdout
+    assert "cache write:" in result.stdout
+
+    # Humanised cache figures make it into the rendered output.
+    assert "2.56M" in result.stdout  # cache read
+    assert "367.0K" in result.stdout  # cache write
+
+    # The percent-of-cap on the main Tokens line is still input+output only.
+    # (186 + 13_100 = 13.3K; batch fixture cap is 5M.)
+    assert "13.3K" in result.stdout

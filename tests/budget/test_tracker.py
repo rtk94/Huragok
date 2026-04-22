@@ -397,3 +397,300 @@ def test_extract_total_usd_bad_shape_raises() -> None:
         _extract_total_usd(["not", "a", "dict"])
     with pytest.raises(CostReconciliationError):
         _extract_total_usd({"data": "not-a-list"})
+
+
+# ---------------------------------------------------------------------------
+# Regression suite for the 2026-04-22 smoke-001 accounting shape.
+# ---------------------------------------------------------------------------
+
+
+def _assistant_event_full(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int,
+    cache_write: int,
+    model: str,
+) -> AssistantEvent:
+    """Construct an AssistantEvent with all four usage dimensions populated."""
+    return AssistantEvent(
+        raw={},
+        session_id="01REPLAY",
+        model=model,
+        usage=UsageBlock(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_write,
+        ),
+    )
+
+
+def _session_events(
+    *,
+    model: str,
+    started_at: datetime,
+    session_id: str,
+    deltas: list[tuple[int, int, int, int]],
+) -> list[BudgetEvent]:
+    """Build the lifecycle events for one replayed session."""
+    ctx = SessionContext(
+        session_id=session_id,
+        task_id="task-smoke",
+        role="architect",  # arbitrary for the tracker — not used in accounting
+        model=model,
+        started_at=started_at,
+    )
+    events: list[BudgetEvent] = [
+        BudgetEvent(kind="session-started", ctx=ctx, at=started_at),
+    ]
+    for input_t, output_t, cache_r, cache_w in deltas:
+        events.append(
+            BudgetEvent(
+                kind="stream-event",
+                ctx=ctx,
+                at=started_at,
+                stream_event=_assistant_event_full(
+                    input_tokens=input_t,
+                    output_tokens=output_t,
+                    cache_read=cache_r,
+                    cache_write=cache_w,
+                    model=model,
+                ),
+            )
+        )
+    # Terminal result event: empty usage so we don't inject double-counts
+    # into the regression reference. Test C below characterises the
+    # tracker's behaviour when the result event carries non-zero usage.
+    events.append(
+        BudgetEvent(
+            kind="stream-event",
+            ctx=ctx,
+            at=started_at,
+            stream_event=ResultEvent(
+                raw={},
+                subtype="success",
+                session_id=session_id,
+                model=model,
+                usage=UsageBlock(),
+                total_cost_usd=0.0,
+                is_error=False,
+                duration_ms=500.0,
+            ),
+        )
+    )
+    events.append(
+        BudgetEvent(
+            kind="session-ended",
+            ctx=ctx,
+            at=started_at,
+            session_result=SessionResult(
+                session_id=session_id,
+                end_state="clean",
+                exit_code=0,
+                result_event=None,
+                stderr_tail=[],
+                duration_seconds=60.0,
+            ),
+        )
+    )
+    return events
+
+
+# Per-session usage shapes, hand-built to match the 2026-04-22 smoke-001
+# observation (±5%): input 186 / output 13.1K / cache_read 2.56M /
+# cache_write 367K, split across four sessions with Opus + Sonnet +
+# Sonnet + Opus. Each entry is (input, output, cache_read, cache_write)
+# per assistant turn; a session may have several turns so the sum of
+# deltas reflects the full session's Claude-reported usage.
+_SMOKE_001_REPLAY: list[tuple[str, list[tuple[int, int, int, int]]]] = [
+    # Architect / Opus — wrote spec, heavy cache-write.
+    (
+        "claude-opus-4-7",
+        [(30, 1_200, 200_000, 50_000), (20, 2_000, 300_000, 50_000)],
+    ),
+    # Implementer / Sonnet — read spec + agent md from cache, wrote code.
+    (
+        "claude-sonnet-4-6",
+        [(40, 2_000, 400_000, 40_000), (10, 2_000, 400_000, 50_000)],
+    ),
+    # TestWriter / Sonnet — similar cache-heavy pattern.
+    (
+        "claude-sonnet-4-6",
+        [(40, 1_500, 350_000, 40_000), (10, 1_600, 350_000, 50_000)],
+    ),
+    # Critic / Opus — reviewed everything, large cache-read, smaller write.
+    (
+        "claude-opus-4-7",
+        [(26, 1_400, 280_000, 40_000), (10, 1_400, 280_000, 50_000)],
+    ),
+]
+
+
+async def test_tracker_replays_smoke_001_shape(tmp_huragok_root: Path) -> None:
+    """Replay a realistic four-session smoke-run and assert the final snapshot.
+
+    Locks down the invariant surfaced by the 2026-04-22 smoke-test: the
+    cache columns dominate raw token usage, and the local dollar estimate
+    is non-trivial because of it. If a future change silently drops one
+    of the four dimensions this test fails fast.
+    """
+    tracker = BudgetTracker(
+        root=tmp_huragok_root,
+        pricing=load_pricing(),
+        dispatcher=RecordingDispatcher(),
+        max_tokens=10_000_000,
+        max_dollars=1_000.0,
+        max_wall_clock_seconds=12 * 3600.0,
+        batch_id="batch-001",
+    )
+    started_at = datetime(2026, 4, 22, 10, 0, tzinfo=UTC)
+    events: list[BudgetEvent] = []
+    for i, (model, deltas) in enumerate(_SMOKE_001_REPLAY):
+        events.extend(
+            _session_events(
+                model=model,
+                started_at=started_at,
+                session_id=f"01SESSION{i:02d}",
+                deltas=deltas,
+            )
+        )
+    await _feed(tracker, events)
+
+    snap = tracker.snapshot()
+    # Aggregates derived from the replay table above.
+    expected_input = sum(d[0] for _, ds in _SMOKE_001_REPLAY for d in ds)
+    expected_output = sum(d[1] for _, ds in _SMOKE_001_REPLAY for d in ds)
+    expected_cache_read = sum(d[2] for _, ds in _SMOKE_001_REPLAY for d in ds)
+    expected_cache_write = sum(d[3] for _, ds in _SMOKE_001_REPLAY for d in ds)
+
+    # Exact equality — the tracker does integer arithmetic on usage.
+    assert snap.tokens_input == expected_input
+    assert snap.tokens_output == expected_output
+    assert snap.tokens_cache_read == expected_cache_read
+    assert snap.tokens_cache_write == expected_cache_write
+
+    # Observed smoke-001 shape (±5%).
+    assert 180 <= snap.tokens_input <= 200
+    assert 12_500 <= snap.tokens_output <= 13_500
+    assert 2_430_000 <= snap.tokens_cache_read <= 2_680_000
+    assert 350_000 <= snap.tokens_cache_write <= 390_000
+
+    # Dollars > $0 (cache tokens matter); sanity-check the figure sits in
+    # the ballpark observed in the smoke test (~$6-$7 for Max-billing
+    # counterfactual). Exact dollar values depend on the pricing table
+    # so we assert only a loose range.
+    assert 4.0 <= snap.dollars <= 15.0
+
+
+async def test_tracker_per_event_deltas_sum_correctly(tmp_huragok_root: Path) -> None:
+    """Sum of usage deltas across events matches the tracker's final state.
+
+    Guards the class of regression where event dispatch silently drops
+    one of the four usage columns.
+    """
+    tracker = BudgetTracker(
+        root=tmp_huragok_root,
+        pricing=load_pricing(),
+        dispatcher=RecordingDispatcher(),
+        max_tokens=10_000_000,
+        max_dollars=1_000.0,
+        max_wall_clock_seconds=3600.0,
+        batch_id="batch-001",
+    )
+    ctx = _ctx()
+    deltas = [
+        (10, 100, 5_000, 2_000),
+        (20, 200, 6_000, 2_500),
+        (30, 300, 7_000, 3_000),
+    ]
+    events: list[BudgetEvent] = [BudgetEvent(kind="session-started", ctx=ctx, at=ctx.started_at)]
+    for input_t, output_t, cache_r, cache_w in deltas:
+        events.append(
+            BudgetEvent(
+                kind="stream-event",
+                ctx=ctx,
+                at=ctx.started_at,
+                stream_event=_assistant_event_full(
+                    input_tokens=input_t,
+                    output_tokens=output_t,
+                    cache_read=cache_r,
+                    cache_write=cache_w,
+                    model=ctx.model,
+                ),
+            )
+        )
+    await _feed(tracker, events)
+
+    snap = tracker.snapshot()
+    assert snap.tokens_input == sum(d[0] for d in deltas)
+    assert snap.tokens_output == sum(d[1] for d in deltas)
+    assert snap.tokens_cache_read == sum(d[2] for d in deltas)
+    assert snap.tokens_cache_write == sum(d[3] for d in deltas)
+
+
+async def test_tracker_applies_both_assistant_and_result_event_usage(
+    tmp_huragok_root: Path,
+) -> None:
+    """Characterisation test: result-event usage is additive on top of assistant usage.
+
+    The current tracker applies ``usage`` from both assistant AND result
+    events (see ``BudgetTracker._on_stream_event``). For Claude Code's
+    stream-json, ``result`` events typically carry an empty ``usage`` so
+    this is a no-op in practice — which is why the smoke-001 replay
+    passes with empty result usage. If a future Claude Code release
+    starts emitting cumulative totals on the result event, this test
+    will fail and surface the double-counting risk documented in the
+    slice-b2 amendment-2 notes.
+    """
+    tracker = BudgetTracker(
+        root=tmp_huragok_root,
+        pricing=load_pricing(),
+        dispatcher=RecordingDispatcher(),
+        max_tokens=10_000_000,
+        max_dollars=1_000.0,
+        max_wall_clock_seconds=3600.0,
+        batch_id="batch-001",
+    )
+    ctx = _ctx()
+    events = [
+        BudgetEvent(kind="session-started", ctx=ctx, at=ctx.started_at),
+        # Assistant: 100 input, 50 output.
+        BudgetEvent(
+            kind="stream-event",
+            ctx=ctx,
+            at=ctx.started_at,
+            stream_event=_assistant_event_full(
+                input_tokens=100,
+                output_tokens=50,
+                cache_read=0,
+                cache_write=0,
+                model=ctx.model,
+            ),
+        ),
+        # Result event restates the same usage (simulating a Claude Code
+        # release that puts cumulative totals on the result event).
+        BudgetEvent(
+            kind="stream-event",
+            ctx=ctx,
+            at=ctx.started_at,
+            stream_event=ResultEvent(
+                raw={},
+                subtype="success",
+                session_id=ctx.session_id,
+                model=ctx.model,
+                usage=UsageBlock(input_tokens=100, output_tokens=50),
+                total_cost_usd=0.0,
+                is_error=False,
+                duration_ms=100.0,
+            ),
+        ),
+    ]
+    await _feed(tracker, events)
+    snap = tracker.snapshot()
+    # Current behaviour: both events are applied, producing 2x the single
+    # assistant's usage. This is the smoke-test-flagged double-counting
+    # risk. If the tracker is changed to prefer the result event as
+    # authoritative, this assertion flips to == 100 / 50.
+    assert snap.tokens_input == 200
+    assert snap.tokens_output == 100

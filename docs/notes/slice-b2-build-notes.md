@@ -582,3 +582,348 @@ clean; no new dependencies.
   *somewhere* when running outside systemd. `docs/deployment.md` was
   not edited in this amendment — it's slightly stale on this point,
   but not wrong.
+
+## Amendment 2026-04-22: smoke-test post-mortem fixes
+
+**Driven by:** `docs/claude-code-prompts/phase-1/slice-b2-prompt-amend-2.md`
+**Motivated by:** first real end-to-end run on 2026-04-22 (`smoke-001`
+in `~/Programming/huragok-smoke-test/`) — five Claude Code sessions
+(Architect → Implementer → TestWriter → Critic, ~4 min wall time)
+produced a `done` task and surfaced nine operator-facing issues that
+this amendment closes.
+
+Items addressed:
+
+1. Status view — cache tokens exposed as sub-lines.
+2. Batch-complete transition — daemon exits when all tasks terminal.
+3. SIGINT-when-idle — single-signal exit when no in-flight session.
+4. `/start` — no longer logs as `invalid_verb`.
+5. `huragok status` graceful on missing state.yaml.
+6. `CLAUDE_CODE_OAUTH_TOKEN` added to runner env allowlist.
+7. Tracker accounting regression tests.
+8. `.env.example` rewrite (OAuth-first).
+9. `docs/deployment.md` updates (auth/billing; Max vs API budget
+   interpretation).
+
+### Per-item details
+
+#### 1. Status view — cache tokens exposed as sub-lines
+
+**Files:** `orchestrator/cli.py`, `tests/test_cli.py`.
+
+The `Tokens:` line now renders `input`, `output`, `cache read`, and
+`cache write` as four two-space-indented sub-lines. The main-line
+percentage still uses `input + output` only — matching the
+`total_tokens()` aggregate that `_check_thresholds` halts on, so the
+displayed percent agrees with the enforcement rule. The JSON output
+(`--json`) already exposes `tokens_cache_read` and
+`tokens_cache_write` under the `budget_consumed` object — a direct
+`model_dump` of `StateFile` — so no JSON change was required;
+verified by a shell-level inspection of the current emitter before
+editing.
+
+Test added: `test_status_exposes_cache_token_sublines` seeds nonzero
+cache values in `.huragok/state.yaml` and asserts the four sub-line
+labels plus humanised figures appear in the rendered output.
+
+#### 2. Batch-complete transition
+
+**Files:** `orchestrator/supervisor/loop.py`, `tests/supervisor/test_loop.py`.
+
+Added `_batch_is_complete(root)` which returns True when `batch.yaml`
+exists, has ≥1 task, and every task's `status.yaml.state` is `done`
+or `blocked` (both terminal per ADR-0002 D3). Added
+`_transition_to_complete(ctx, state)` which flips the phase to
+`complete`, clears `current_task`/`current_agent`/`session_id` so
+operators don't see a dangling pointer in `huragok status`, writes a
+`batch-complete` audit event, and dispatches a `batch-complete`
+notification with no reply verbs (FYI, not a gate).
+
+The new check sits inside the main loop's "next_task is None"
+branch, so the per-iteration work is unchanged on the happy path.
+The `phase` Literal in `orchestrator/state/schemas.py` already
+included `complete`, so no schema migration was needed — the
+micro-exception allowance for schema touches was NOT triggered.
+
+**Tests added:**
+
+- `test_loop_transitions_to_complete_when_all_tasks_done` — one task
+  pre-seeded `done`, asserts `phase=complete`, `current_task=None`,
+  and a `batch-complete` audit record.
+- `test_loop_transitions_to_complete_with_blocked_task` — two tasks,
+  one `done`, one `blocked`, asserts still transitions to `complete`
+  (blocked is terminal).
+
+Behaviourally this subsumes what `supervisor.idle.no_pending_tasks`
+used to log forever. The pre-amendment integration test
+`test_loop_exits_on_stop_request_even_without_work` — which
+pre-marked its one task `done` and relied on a `stop` file to break
+the loop — continues to pass because the loop now exits via
+`complete` before the stop file is written; both paths return exit
+code 0 and the test only checks the exit code.
+
+#### 3. SIGINT-when-idle exits immediately
+
+**Files:** `orchestrator/supervisor/loop.py`, `tests/supervisor/test_loop.py`.
+
+The main loop already exited within one tick of `shutting_down`
+firing — every idle-sleep site goes through `sleep_or_shutdown`. The
+latent drag was in `run_supervisor`'s finally block, which did
+`await asyncio.gather(tracker_task, dispatcher_task,
+return_exceptions=True)`. A `TelegramDispatcher.start()` in
+mid-`getUpdates` is blocked on a 25-second long-poll request that
+does not observe the stop event until the HTTP call completes. Under
+a real Telegram-enabled smoke run that added up to 25s of apparent
+"daemon won't exit" time after the first Ctrl-C, which is what
+prompted the operator to SIGINT again.
+
+Introduced `_shutdown_background_tasks(tasks, grace_seconds)` plus a
+`DEFAULT_SHUTDOWN_GRACE_SECONDS = 1.0` constant. The finally block
+gathers with a 1s timeout, then cancels stragglers. The tracker's
+drain loop completes in milliseconds in practice and the
+`LoggingDispatcher` returns immediately on stop, so the only
+coroutine this cancel can actually hit is the Telegram long-poll —
+which is the motivating case.
+
+Signal handler itself is unchanged: `_handle_term` already sets
+`shutting_down` on the first signal and escalates via `os._exit` on
+the second, matching ADR-0002 D1.
+
+**Test added:** `test_shutdown_cancels_blocked_dispatcher_within_grace`
+— uses a `_WedgedDispatcher` whose `start()` sleeps 30s regardless
+of the stop event. Deletes `batch.yaml` so the loop sits in the
+"waiting for submit" idle path. Writes `stop` after 150ms, asserts
+the whole `run_supervisor` returns within 2.5s (generous envelope
+for 1s grace + startup jitter).
+
+The "SIGINT mid-session lets the session finish" behaviour is
+preserved implicitly: `run_session` doesn't observe the stop event,
+and the main loop is blocked in `await _launch_session(...)` for the
+session's lifetime, so the finally block can't fire until the
+session returns.
+
+#### 4. `/start` no longer logs as `invalid_verb`
+
+**Files:** `orchestrator/notifications/telegram.py`, `tests/notifications/test_telegram.py`.
+
+Added `_is_bot_start_command(text)` which matches `/start`,
+`/start@botname`, `/start foo`, and case-insensitive variants. The
+`_handle_update` path calls it before falling back to the existing
+`invalid_verb` log; on a match it emits a `telegram.bot.initialization`
+DEBUG record (so operators can still grep for bot-init flow) rather
+than the noisy INFO record. No outbound reply is sent — that's a UX
+flourish for a later amendment.
+
+**Tests added (3):**
+
+- `test_start_command_does_not_log_invalid_verb` — bare `/start`,
+  verifies no `invalid_verb` record and a DEBUG `bot.initialization`
+  is present.
+- `test_start_command_case_insensitive_and_with_payload` — `/START`,
+  `/start hello`, and `/start@mybot` all take the bot-init path.
+- `test_other_unknown_text_still_logs_invalid_verb` — non-`/start`
+  unknown text preserves the prior INFO log.
+
+Tests use `structlog.testing.capture_logs()` to intercept records;
+structlog is wired to `WriteLoggerFactory` (not stdlib logging), so
+pytest's `caplog` doesn't see the daemon's output.
+
+#### 5. `huragok status` graceful on missing state.yaml
+
+**Files:** `orchestrator/cli.py`, `tests/test_cli.py`.
+
+`status` now catches `FileNotFoundError` on `read_state(root)` and
+renders a friendly two-line message pointing at `huragok submit`.
+The `--json` variant returns
+`{"phase": "no-batch", "batch_id": null}` rather than a Python
+traceback. Exit code is 0 in both cases.
+
+`huragok tasks` already handles this path cleanly via
+`_load_batch_if_any` returning None; verified that path prints
+`no batch in flight` and exits 0 in a fresh `.huragok/`.
+
+**Tests added (3):**
+
+- `test_status_fresh_huragok_with_no_state_yaml_is_friendly`.
+- `test_status_json_fresh_huragok_with_no_state_yaml`.
+- `test_tasks_fresh_huragok_with_no_batch_is_friendly` — characterises
+  the pre-existing behaviour so a regression would trip it.
+
+#### 6. `CLAUDE_CODE_OAUTH_TOKEN` in runner env allowlist
+
+**File:** `orchestrator/session/runner.py`, `tests/session/test_runner.py`.
+
+Added a parallel conditional to the existing `ANTHROPIC_API_KEY`
+pass-through in `default_session_env()`: when
+`CLAUDE_CODE_OAUTH_TOKEN` is set on the parent, forward it. Order:
+API key block first, OAuth block second. The runner doesn't enforce
+precedence between the two — that's Claude Code's own auth logic.
+
+Deliberately did NOT add a `claude_code_oauth_token` field on
+`HuragokSettings`: the runner reads directly from `os.environ`, and
+adding it to the settings type would imply CLI involvement that
+doesn't exist.
+
+**Test added:** `test_scrubbed_env_forwards_claude_code_oauth_token`
+— three cases (neither set → neither forwarded; OAuth alone → OAuth
+forwarded, API key absent; both set → both forwarded).
+
+#### 7. Tracker accounting regression tests
+
+**File:** `tests/budget/test_tracker.py`. No tracker-source changes.
+
+Added three tests:
+
+- **`test_tracker_replays_smoke_001_shape`** — four sessions in
+  order (Opus / Sonnet / Sonnet / Opus) with per-turn deltas summing
+  to input ≈ 186, output ≈ 13.1K, cache_read ≈ 2.56M, cache_write ≈
+  367K. Asserts the tracker's final snapshot equals the arithmetic
+  sum of deltas (exact equality, not ±5% — the tracker is integer
+  arithmetic) and that the dollar figure lands in $4–$15, bracketing
+  the smoke run's observed $6.67.
+- **`test_tracker_per_event_deltas_sum_correctly`** — minimal
+  three-event replay; guards the "one of the four columns silently
+  dropped" class of regression.
+- **`test_tracker_applies_both_assistant_and_result_event_usage`**
+  — CHARACTERISATION test. See flag below.
+
+##### 🚩 FLAG — latent double-counting risk in `_on_stream_event`
+
+The existing tracker code in `BudgetTracker._on_stream_event`:
+
+```python
+if isinstance(stream_event, AssistantEvent):
+    self._apply_event_usage(ctx, stream_event.usage, stream_event.model)
+elif isinstance(stream_event, ResultEvent):
+    # Result event's usage is authoritative for the session —
+    # when we see it, subtract any running delta for this session
+    # and replace with the authoritative totals. Implementation
+    # note: B1 accumulates straight through because sessions are
+    # strictly sequential; we only reset on session-ended below.
+    self._apply_event_usage(ctx, stream_event.usage, stream_event.model)
+```
+
+The comment says "subtract and replace"; the code simply adds. Today
+this is harmless because Claude Code's `result` events typically
+carry empty `usage` blocks, and the smoke-001 replay test passes
+with that shape. `test_tracker_applies_both_assistant_and_result_event_usage`
+constructs a scenario where the result event carries non-empty
+`usage` identical to an assistant event and asserts the current
+behaviour: tokens double. **This is a latent bug, not a current one,
+and per the amendment-2 stop condition I did NOT change tracker
+logic to fix it.** A follow-up amendment should decide whether
+result usage should supersede (per the comment) or be additive (per
+the code), and update the tracker accordingly. The characterisation
+test will flip sign on that change and document the decision.
+
+Per the prompt's direction to flag rather than silently fix: no
+fix applied here.
+
+#### 8. `.env.example` rewrite
+
+**File:** `.env.example`.
+
+Reorganised into four sections: Authentication (choose one) →
+Admin key (optional) → Telegram (optional) → Huragok-specific. The
+Authentication section spells out Option A (Max via OAuth, cached
+creds interactively, `CLAUDE_CODE_OAUTH_TOKEN` under systemd) and
+Option B (`ANTHROPIC_API_KEY` for pay-as-you-go), plus the
+API-key-wins precedence warning. No tests required —
+`.env.example` is reference-only; `pydantic-settings` loads `.env`
+(not `.env.example`).
+
+#### 9. `docs/deployment.md` updates
+
+**File:** `docs/deployment.md`.
+
+Added two new sections between *Prerequisites* and *First-time
+setup*:
+
+- **Authentication and billing** — Options A/B, the
+  systemd-isolated-home `setup-token` case, the precedence-and-warning
+  paragraph, and the 2026-04-22 smoke-test empirical note on cached
+  OAuth routing to Max.
+- **Budget interpretation for Max vs. API** — `max_dollars` as real
+  dollars on API billing, counterfactual on Max; the cache-dominates
+  note; the suggestion to set `max_dollars` 5–10x higher on Max or
+  treat it as a safety net.
+
+Also rewrote the *Configure secrets* subsection to present OAuth
+Option A as the default path, with API key as the alternative, and
+removed the implication that `ANTHROPIC_API_KEY` is required.
+
+### Deviations from the prompt
+
+1. **Item 3 scope.** The prompt listed
+   `orchestrator/supervisor/signals.py` and
+   `orchestrator/supervisor/loop.py`. The actual fix is in
+   `loop.py`'s finally block (bounded-wait-then-cancel for the
+   tracker and dispatcher tasks). `signals.py` needed no change —
+   the signal handler already sets `shutting_down` synchronously and
+   the main loop already exits within one tick on that event. The
+   operator-facing "did not exit" behaviour came from the Telegram
+   dispatcher's in-flight poll, not from the signal path.
+
+2. **Item 5 scope.** The prompt asked for the same treatment on
+   `huragok tasks` if it shared the failure mode. It doesn't —
+   `tasks` already uses `_load_batch_if_any` which swallows
+   `FileNotFoundError`. Kept the test
+   (`test_tasks_fresh_huragok_with_no_batch_is_friendly`) as a
+   characterisation so a future regression in that path trips a
+   failing test.
+
+3. **Item 7 produced a flag.** See the boxed section above:
+   `_on_stream_event` applies result-event usage additively rather
+   than as a supersede, contradicting its own comment. Scope says
+   "flag, don't silently fix"; I flagged.
+
+4. **`/start` response (Item 4).** The prompt explicitly deferred
+   sending a response to `/start` ("nice touch, but later
+   amendment"). Not shipped; the DEBUG `bot.initialization` record is
+   the only observable effect.
+
+### Tests
+
+Before this amendment: 264 passed.
+After this amendment: **278 passed** (added 14 across five files).
+
+| File                                           | Added |
+| ---------------------------------------------- | ----- |
+| `tests/test_cli.py`                            | +4    |
+| `tests/supervisor/test_loop.py`                | +3    |
+| `tests/notifications/test_telegram.py`         | +3    |
+| `tests/session/test_runner.py`                 | +1    |
+| `tests/budget/test_tracker.py`                 | +3    |
+| **Total**                                      | **+14** |
+
+- `uv run pytest` → all green.
+- `uv run ruff check .` → clean.
+- `uv run ruff format --check .` → clean.
+- No new runtime dependencies.
+
+### Sharp edges introduced
+
+- **Shutdown grace is 1 second**, constant at module scope
+  (`DEFAULT_SHUTDOWN_GRACE_SECONDS`). Coroutines that legitimately
+  need longer than 1s to drain would be truncated by the cancel. The
+  tracker's drain loop is bounded by `event_queue` size (microseconds
+  in practice), and the Telegram dispatcher's own drain is trivial
+  once its in-flight poll is cancelled. Flagged here so any future
+  long-running coroutine added to `run_supervisor` knows about the
+  1s ceiling.
+
+- **`_is_bot_start_command` only matches `/start`.** Other slash
+  commands (`/help`, `/stop`, etc.) still land in `invalid_verb`.
+  That's deliberate: only `/start` is universally surfaced by
+  Telegram as the "Start" button in every new bot chat. If a future
+  amendment adds in-bot commands, the allowlist grows there.
+
+- **OAuth pass-through is conditional and quiet.** If the operator
+  sets neither `ANTHROPIC_API_KEY` nor `CLAUDE_CODE_OAUTH_TOKEN`
+  and has no cached `~/.claude/` creds (e.g., systemd with sandboxed
+  home), sessions will fail inside Claude Code's auth logic — not
+  with a Huragok-level precheck. The existing `claude --version`
+  startup check runs `claude` without auth, which succeeds, so
+  Huragok boots even when subsequent sessions will fail on auth. An
+  operator-facing auth-health check is a candidate for a future
+  amendment; it's not in scope here.

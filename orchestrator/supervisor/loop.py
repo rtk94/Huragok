@@ -80,6 +80,7 @@ from orchestrator.supervisor.signals import (
 __all__ = [
     "DEFAULT_REACHABILITY_POLL_SECONDS",
     "DEFAULT_REQUEST_POLL_SECONDS",
+    "DEFAULT_SHUTDOWN_GRACE_SECONDS",
     "ROLE_FOR_STATE",
     "SessionAttempt",
     "SupervisorContext",
@@ -95,6 +96,13 @@ DEFAULT_REQUEST_POLL_SECONDS: float = 1.5
 # decide whether to transition in/out of ``paused``. One second is a
 # rounding error compared to the 10-minute grace window.
 DEFAULT_REACHABILITY_POLL_SECONDS: float = 1.0
+
+# Maximum time the supervisor waits for long-lived coroutines (tracker,
+# dispatcher) to drain after shutdown fires. Above this, stragglers are
+# cancelled. Intentionally well below operator patience (~2s felt-lag
+# for Ctrl-C) while above the worst-case tracker drain of a realistic
+# queued-event burst.
+DEFAULT_SHUTDOWN_GRACE_SECONDS: float = 1.0
 
 # ADR-0003 D1: role chosen by the Supervisor from the current status.state.
 # ``None`` indicates a non-session state (terminal or waiting on operator).
@@ -324,15 +332,53 @@ async def run_supervisor(
         exit_code = await _main_loop(ctx)
     finally:
         signal_state.shutting_down.set()
-        # Wait for the long-lived coroutines to exit. Both are designed
-        # to drain cleanly when the stop event fires.
-        await asyncio.gather(tracker_task, dispatcher_task, return_exceptions=True)
+        # Give the long-lived coroutines a short grace window to drain
+        # cleanly; cancel stragglers. TelegramDispatcher's poll loop is
+        # the motivating case — its ``getUpdates`` call can be blocked
+        # on a 25-second long-poll that doesn't observe the stop event
+        # until the current request completes. Without this cancel, a
+        # SIGINT on an idle daemon spends up to 25s in this finally
+        # block before returning control to the operator. The grace
+        # window is generous enough that a reasonable clean-shutdown
+        # (LoggingDispatcher and the tracker drain) completes within
+        # it.
+        await _shutdown_background_tasks(
+            (tracker_task, dispatcher_task),
+            grace_seconds=DEFAULT_SHUTDOWN_GRACE_SECONDS,
+        )
         # Release the batch-log file handle even when the supervisor
         # aborts on an exception; leaving it open wedges the fd until
         # the process itself exits.
         close_file_sink()
 
     return exit_code
+
+
+async def _shutdown_background_tasks(
+    tasks: tuple[asyncio.Task[object], ...],
+    *,
+    grace_seconds: float,
+) -> None:
+    """Gather ``tasks`` with a bounded wait, then cancel stragglers.
+
+    The main loop exits as soon as :attr:`SignalState.shutting_down`
+    fires. The long-lived coroutines also observe the same event, but
+    the Telegram dispatcher's in-flight ``getUpdates`` request is not
+    interruptible — it continues until the HTTP server replies or the
+    25-second server-side timeout elapses. Canceling after a short
+    grace is the cheapest way to make SIGINT-on-idle feel instant
+    without reshaping the dispatcher.
+    """
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=grace_seconds,
+        )
+    except TimeoutError:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +430,13 @@ async def _main_loop(ctx: SupervisorContext) -> int:
         # 4. Find the next non-terminal task.
         next_task = _pick_next_task(ctx.root, state)
         if next_task is None:
+            # All tasks are in terminal states (done / blocked) and
+            # there's no in-flight session. Transition to `complete`,
+            # emit audit + notification, and exit cleanly. The no-batch
+            # case (batch.yaml absent) idles instead.
+            if _batch_is_complete(ctx.root):
+                await _transition_to_complete(ctx, state)
+                break
             log.info("supervisor.idle.no_pending_tasks")
             await _idle_sleep(ctx, idle_ticks)
             idle_ticks += 1
@@ -1025,6 +1078,77 @@ def _transition_to_halted(
                 "reason": reason,
             },
         )
+
+
+def _batch_is_complete(root: Path) -> bool:
+    """True when batch.yaml exists and every task's state is terminal.
+
+    Terminal states per ADR-0001 D6 / ADR-0002 D3 are ``done`` and
+    ``blocked`` — the only two that the pipeline cannot drive forward
+    without operator input. ``awaiting-human`` is deliberately excluded:
+    the daemon is still waiting on a reply. A task without a status.yaml
+    on disk is treated as pending (not terminal), which keeps the
+    "submit then never run" case idling instead of prematurely completing.
+    """
+    try:
+        batch = read_batch(root)
+    except FileNotFoundError:
+        return False
+    if not batch.tasks:
+        # Empty-task batches are a misconfiguration, not something to
+        # auto-complete. Leave them idle so the operator notices.
+        return False
+    for task_entry in batch.tasks:
+        try:
+            status = read_status(root, task_entry.id)
+        except FileNotFoundError:
+            return False
+        if status.state not in ("done", "blocked"):
+            return False
+    return True
+
+
+async def _transition_to_complete(
+    ctx: SupervisorContext,
+    state: StateFile,
+) -> None:
+    """Move the batch into ``complete`` and emit the batch-complete signals.
+
+    Called when every task reached ``done`` or ``blocked`` and no
+    session is in flight. Clears ``current_task`` / ``current_agent``
+    so operators reading status don't see a dangling "last task"
+    pointer. Also appends a ``batch-complete`` audit event and
+    dispatches a ``batch-complete`` notification (no reply verbs — this
+    is an FYI, not a gate).
+    """
+    log = structlog.get_logger(__name__).bind(component="supervisor")
+    now = datetime.now(UTC)
+    state.phase = "complete"
+    state.current_task = None
+    state.current_agent = None
+    state.session_id = None
+    state.halted_reason = None
+    state.last_checkpoint = now
+    write_state(ctx.root, state)
+    log.info("supervisor.batch.complete", batch_id=state.batch_id)
+    if state.batch_id is not None:
+        append_audit(
+            ctx.root,
+            state.batch_id,
+            {
+                "ts": now.isoformat(),
+                "kind": "batch-complete",
+                "batch_id": state.batch_id,
+                "session_count": state.session_count,
+            },
+        )
+    notification = Notification.make(
+        kind="batch-complete",
+        summary=f"batch {state.batch_id} complete",
+        reply_verbs=[],
+        metadata={"batch_id": state.batch_id} if state.batch_id is not None else None,
+    )
+    await ctx.dispatcher.send(notification)
 
 
 async def _dispatch_rate_limit_notification(

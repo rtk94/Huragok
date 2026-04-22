@@ -639,3 +639,91 @@ async def test_outbound_message_contains_summary_and_id() -> None:
 )
 def test_normalize_verb_param(alias: str, canonical: str) -> None:
     assert normalize_verb(alias) == canonical
+
+
+# ---------------------------------------------------------------------------
+# Bot /start — Telegram's universal first message.
+# ---------------------------------------------------------------------------
+
+
+async def test_start_command_does_not_log_invalid_verb(tmp_path: Path) -> None:
+    """``/start`` from a new-bot greeting is silent, not an invalid-verb warning."""
+    import structlog.testing
+
+    (tmp_path / ".huragok").mkdir()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    client = _make_client(handler)
+    dispatcher = _make_dispatcher(client=client, root=tmp_path)
+
+    with structlog.testing.capture_logs() as cap:
+        update = {
+            "update_id": 1,
+            "message": {"chat": {"id": 12345}, "text": "/start"},
+        }
+        await dispatcher._handle_update(update)
+
+    events = [entry.get("event") for entry in cap]
+    assert "telegram.reply.invalid_verb" not in events
+    # DEBUG record emitted under its own event name so operators can
+    # grep for it if they want to audit bot-init flow.
+    debug_entries = [e for e in cap if e.get("event") == "telegram.bot.initialization"]
+    assert debug_entries and debug_entries[0]["log_level"] == "debug"
+
+    # No reply file was persisted — /start is not a reply attempt.
+    req_dir = tmp_path / ".huragok" / "requests"
+    assert not req_dir.exists() or not any(req_dir.iterdir())
+
+
+async def test_start_command_case_insensitive_and_with_payload(tmp_path: Path) -> None:
+    """``/START`` and ``/start foo`` are also treated as bot-init, not replies."""
+    import structlog.testing
+
+    (tmp_path / ".huragok").mkdir()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    client = _make_client(handler)
+    dispatcher = _make_dispatcher(client=client, root=tmp_path)
+
+    with structlog.testing.capture_logs() as cap:
+        for update_id, text in (
+            (10, "/START"),
+            (11, "/start hello"),
+            (12, "/start@mybot"),
+        ):
+            await dispatcher._handle_update(
+                {"update_id": update_id, "message": {"chat": {"id": 12345}, "text": text}}
+            )
+
+    events = [entry.get("event") for entry in cap]
+    assert "telegram.reply.invalid_verb" not in events
+    # Every /start variant landed under the init event.
+    init_events = [e for e in events if e == "telegram.bot.initialization"]
+    assert len(init_events) == 3
+
+
+async def test_other_unknown_text_still_logs_invalid_verb(tmp_path: Path) -> None:
+    """Unknown text that isn't ``/start`` continues to log at INFO."""
+    import structlog.testing
+
+    (tmp_path / ".huragok").mkdir()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    client = _make_client(handler)
+    dispatcher = _make_dispatcher(client=client, root=tmp_path)
+
+    with structlog.testing.capture_logs() as cap:
+        update = {
+            "update_id": 20,
+            "message": {"chat": {"id": 12345}, "text": "hello there"},
+        }
+        await dispatcher._handle_update(update)
+
+    matching = [e for e in cap if e.get("event") == "telegram.reply.invalid_verb"]
+    assert matching and matching[0]["log_level"] == "info"

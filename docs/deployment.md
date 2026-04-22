@@ -14,8 +14,11 @@ in `docs/notes/slice-*-build-notes.md`.
 - **Claude Code `>= 2.1.91`** — `npm install -g @anthropic-ai/claude-code`
   or equivalent. The daemon refuses to start below this minimum
   (ADR-0002 D2).
-- **An Anthropic API key** (`ANTHROPIC_API_KEY`). Required; the session
-  runner forwards it to every `claude -p` subprocess.
+- **Claude Code authentication.** Either a Max subscription (cached
+  OAuth credentials from `claude login`, or a long-lived token from
+  `claude setup-token`) **or** an Anthropic API key
+  (`ANTHROPIC_API_KEY`) for pay-as-you-go billing. See *Authentication
+  and billing* below for the tradeoffs.
 - **Optional: an Anthropic Admin API key** (`ANTHROPIC_ADMIN_API_KEY`)
   for authoritative dollar reconciliation via the Cost API. Without
   one the daemon uses the shipped pricing table for dollar estimates
@@ -24,6 +27,93 @@ in `docs/notes/slice-*-build-notes.md`.
   notifications. Without a bot token the daemon falls back to the
   no-network `LoggingDispatcher`; batches still run, but you won't
   get notified when one halts or hits a budget threshold.
+
+## Authentication and billing
+
+Huragok launches Claude Code as a subprocess, so whatever mechanism
+Claude Code uses to authenticate is what the daemon uses too. There
+are two supported routes, and they route billing to different accounts:
+
+### Option A — Max subscription via OAuth (recommended for Max users)
+
+Run `claude login` once on the machine that will host the daemon.
+Claude Code caches OAuth credentials under `~/.claude/.credentials.json`.
+The session runner inherits `HOME` from its parent process, so
+`claude -p` finds those credentials automatically and sessions bill
+against your Max subscription.
+
+Interactive runs (`huragok run` from your own shell) work with cached
+creds alone — no env var needed.
+
+For **systemd deployment**, the unit file's sandboxing (`ProtectHome=read-only`,
+`PrivateTmp=true`, and so on — see the unit file below) can isolate
+the daemon from your user home. In that case, cached OAuth creds are
+not reachable. Generate a long-lived token with:
+
+```bash
+claude setup-token
+```
+
+Copy the printed `sk-ant-oat01-...` value into your `EnvironmentFile`:
+
+```dotenv
+CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+```
+
+The runner passes this through on every session subprocess.
+
+### Option B — API credits via `ANTHROPIC_API_KEY` (pay-as-you-go)
+
+Set `ANTHROPIC_API_KEY=sk-ant-api-...` in the environment. Billing
+routes through your Anthropic Console account's API credit balance,
+NOT your Max subscription.
+
+### Precedence and a warning
+
+When both an API key and OAuth credentials are present, **the API key
+wins** per Claude Code's auth precedence. Setting `ANTHROPIC_API_KEY`
+on a Max-subscribed machine silently costs real money — work that
+would otherwise be covered by your Max quota now hits API credits. Do
+not set both unless that's what you want.
+
+Empirically verified on Claude Code 2.1.117 (smoke-test run on
+2026-04-22): `claude -p` with cached OAuth creds and no
+`ANTHROPIC_API_KEY` in env routes billing to the Max subscription.
+This contradicts at least one GitHub issue thread predating the fix;
+the current behaviour is the working one.
+
+## Budget interpretation for Max vs. API
+
+`batch.yaml` exposes `max_dollars` as a budget cap. What that figure
+*means* depends on your billing route:
+
+### On API credits (Option B)
+
+`max_dollars` is **theoretical API cost** computed from the local
+pricing table at `orchestrator/pricing.yaml`. It corresponds roughly
+one-to-one with real dollars off your API balance. The 100% halt
+threshold (ADR-0002 D4) is a useful safety net.
+
+### On Max billing (Option A)
+
+`max_dollars` is a **counterfactual figure** — what the same session
+would have cost against API credits. Actual Max usage is measured by
+Anthropic in rate-limit windows (5-hour session and weekly message
+caps), not in dollars. The dollar figure remains useful as a
+"work intensity" proxy, but it does not track your Max quota.
+
+**Cache tokens dominate the dollar estimate.** Claude Code
+aggressively caches system prompts, agent files, and project context.
+A small-looking task routinely produces several dollars of theoretical
+API cost through cache reads and writes (the 2026-04-22 smoke-001 run
+burned ~$6.67 of theoretical cost on a ~4-minute trivial Python task).
+`huragok status` now surfaces `cache read` and `cache write` as
+sub-lines under `Tokens:` so the cache footprint is visible.
+
+Suggested practice on Max: set `max_dollars` 5–10x what you would for
+API billing, or treat it as an emergency safety net rather than a
+primary gate. The strict budgets that matter on Max are
+`wall_clock_hours` and `max_iterations`.
 
 ## First-time setup
 
@@ -51,12 +141,28 @@ mkdir -p ~/.config/huragok
 install -m 0600 /dev/null ~/.config/huragok/huragok.env
 ```
 
-Populate it with at least:
+Populate it based on your billing route (see *Authentication and
+billing* above for the tradeoffs):
 
 ```dotenv
 # ~/.config/huragok/huragok.env
+
+# --- Authentication: pick ONE path ----------------------------------------
+#
+# Option A — Max subscription. For interactive foreground runs, cached
+# OAuth creds from `claude login` are enough and no env var is needed.
+# For systemd where ~/.claude/ may be unreachable, generate a long-
+# lived token with `claude setup-token` and uncomment:
+#
+# REPLACE WITH YOUR ACTUAL OAUTH TOKEN
+# CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+#
+# Option B — API credits. Setting this on a Max machine silently
+# routes billing to API credits; do not combine with Option A unless
+# you specifically want API billing.
+#
 # REPLACE WITH YOUR ACTUAL API KEY
-ANTHROPIC_API_KEY=sk-ant-api03-...
+# ANTHROPIC_API_KEY=sk-ant-api03-...
 
 # Optional. If set, the daemon queries the Anthropic Cost API at
 # session and batch end to reconcile dollar totals.

@@ -225,9 +225,12 @@ def _render_human_status(
     token_pct = _pct(tokens_total, budgets.max_tokens)
     stdout.print(
         f"Tokens:         {_fmt_count(tokens_total)} / {_fmt_count(budgets.max_tokens)}    "
-        f"({token_pct}%)  "
-        f"input {_fmt_count(consumed.tokens_input)}  output {_fmt_count(consumed.tokens_output)}"
+        f"({token_pct}%)"
     )
+    stdout.print(f"  input:        {_fmt_count(consumed.tokens_input)}")
+    stdout.print(f"  output:       {_fmt_count(consumed.tokens_output)}")
+    stdout.print(f"  cache read:   {_fmt_count(consumed.tokens_cache_read)}")
+    stdout.print(f"  cache write:  {_fmt_count(consumed.tokens_cache_write)}")
 
     dollar_pct = _pct(consumed.dollars, budgets.max_dollars)
     stdout.print(
@@ -280,9 +283,16 @@ def status(
 
     try:
         state = read_state(root)
-    except FileNotFoundError as exc:
-        stderr.print(f"[red]error:[/red] {exc}")
-        raise typer.Exit(1) from exc
+    except FileNotFoundError:
+        # Fresh repo that hasn't run ``huragok submit`` yet. The raw
+        # FileNotFoundError traceback was unhelpful; render a friendly
+        # message and exit 0 so operators aren't alarmed.
+        if json_output:
+            typer.echo(json.dumps({"phase": "no-batch", "batch_id": None}, indent=2))
+        else:
+            stdout.print(Text("huragok — no batch submitted", style="bold"))
+            stdout.print("Run `huragok submit <batch.yaml>` to begin.")
+        return
 
     if json_output:
         payload = state.model_dump(mode="json", by_alias=True)

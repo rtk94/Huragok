@@ -130,6 +130,37 @@ async def test_scrubbed_env_excludes_marker(
     assert "ANTHROPIC_API_KEY" not in env
 
 
+async def test_scrubbed_env_forwards_claude_code_oauth_token(
+    tmp_repo_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``CLAUDE_CODE_OAUTH_TOKEN`` forwards like ``ANTHROPIC_API_KEY`` does.
+
+    The systemd deployment path (isolated ``HOME``) can't fall back to
+    cached OAuth creds, so the long-lived token from
+    ``claude setup-token`` needs to reach the subprocess via the env.
+    """
+    # Neither key: neither forwarded.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    env = default_session_env(subagent_model="claude-sonnet-4-6")
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+    # Only OAuth set: only OAuth forwarded.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-test")
+    env = default_session_env(subagent_model="claude-sonnet-4-6")
+    assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-test"
+    assert "ANTHROPIC_API_KEY" not in env
+
+    # Both set: both forwarded. The runner doesn't enforce precedence
+    # between them — that's Claude Code's concern.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-api-test")
+    env = default_session_env(subagent_model="claude-sonnet-4-6")
+    assert env.get("ANTHROPIC_API_KEY") == "sk-api-test"
+    assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-oat01-test"
+
+
 async def test_runner_forwards_extra_env(tmp_repo_root: Path) -> None:
     # ``FAKE_CLAUDE_MODE`` is an "extra" env var — confirm the runner
     # passes it through to the subprocess (the fake-claude script
