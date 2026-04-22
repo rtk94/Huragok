@@ -1,0 +1,28 @@
+[Unit]
+Description=Huragok — autonomous multi-agent development orchestration
+Documentation=https://github.com/rtk94/huragok/blob/main/docs/adr/ADR-0001-huragok-orchestration.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+WorkingDirectory=%h/huragok-runtime
+EnvironmentFile=%h/.config/huragok/huragok.env
+ExecStart=%h/.local/bin/uv run huragok run
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=60s
+TimeoutStopSec=120s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Tier 1 secrets (ADR-0001 D9). Upgrade to LoadCredential for Tier 2.
+# Filesystem hardening — target repo lives under %h; no system writes.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/huragok-runtime
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

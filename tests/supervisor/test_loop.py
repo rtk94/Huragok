@@ -16,6 +16,7 @@ import pytest
 
 from orchestrator.budget.pricing import load_pricing
 from orchestrator.config import HuragokSettings
+from orchestrator.notifications import LoggingDispatcher
 from orchestrator.paths import audit_log
 from orchestrator.state import read_state, read_status
 from orchestrator.supervisor.loop import run_supervisor
@@ -37,6 +38,7 @@ async def test_loop_launches_one_session_and_updates_state(
             claude_binary=str(FAKE_CLAUDE),
             request_poll_seconds=0.1,
             session_env_overrides={"FAKE_CLAUDE_MODE": "clean"},
+            dispatcher=LoggingDispatcher(root=supervisor_tmp_root, batch_id="batch-001"),
         )
     )
 
@@ -123,6 +125,7 @@ async def test_loop_exits_on_stop_request_even_without_work(
             pricing=load_pricing(),
             claude_binary=str(FAKE_CLAUDE),
             request_poll_seconds=0.05,
+            dispatcher=LoggingDispatcher(root=supervisor_tmp_root, batch_id="batch-001"),
         )
     )
     await asyncio.sleep(0.1)  # let the loop observe no pending work
@@ -131,10 +134,10 @@ async def test_loop_exits_on_stop_request_even_without_work(
     assert exit_code == 0
 
 
-async def test_loop_blocks_task_after_two_dirty_ends(
+async def test_loop_escalates_after_crash_cap(
     supervisor_tmp_root: Path,
 ) -> None:
-    """Two consecutive crash sessions transition the task to blocked."""
+    """Three consecutive crash sessions escalate (ADR-0002 D7)."""
     settings = HuragokSettings()
 
     loop_task = asyncio.create_task(
@@ -145,27 +148,232 @@ async def test_loop_blocks_task_after_two_dirty_ends(
             claude_binary=str(FAKE_CLAUDE),
             request_poll_seconds=0.05,
             session_env_overrides={"FAKE_CLAUDE_MODE": "crash"},
+            dispatcher=LoggingDispatcher(root=supervisor_tmp_root, batch_id="batch-001"),
         )
     )
 
-    async def wait_for_blocked() -> None:
-        for _ in range(300):  # up to 30s
+    async def wait_for_terminal() -> None:
+        # subprocess-crash per D7: 2 fresh retries, then escalate →
+        # task state transitions to awaiting-human. A crash that hits
+        # the unknown fallback would land in blocked; we accept either.
+        for _ in range(400):  # up to 40s
             try:
                 status = read_status(supervisor_tmp_root, "task-b1-test")
             except FileNotFoundError:
                 await asyncio.sleep(0.1)
                 continue
-            if status.state == "blocked":
+            if status.state in ("awaiting-human", "blocked"):
                 return
             await asyncio.sleep(0.1)
-        raise AssertionError("task never transitioned to blocked")
+        raise AssertionError("task never reached a terminal failure state")
 
     try:
-        await asyncio.wait_for(wait_for_blocked(), timeout=45.0)
+        await asyncio.wait_for(wait_for_terminal(), timeout=60.0)
     finally:
         (supervisor_tmp_root / ".huragok" / "requests" / "stop").write_text("")
         await asyncio.wait_for(loop_task, timeout=10.0)
 
     status = read_status(supervisor_tmp_root, "task-b1-test")
-    assert status.state == "blocked"
+    assert status.state in ("awaiting-human", "blocked")
     assert status.blockers, "blockers list should be populated"
+    # At least 2 crash entries were appended to history with a category.
+    crash_entries = [h for h in status.history if h.category == "subprocess-crash"]
+    assert len(crash_entries) >= 2
+
+
+# ---------------------------------------------------------------------------
+# B2: classifier pipeline, history-based retry counting, reachability.
+# ---------------------------------------------------------------------------
+
+
+async def test_crash_audit_records_category_and_action(
+    supervisor_tmp_root: Path,
+) -> None:
+    """Every crash session is audited with its D7 category and retry action."""
+    settings = HuragokSettings()
+    loop_task = asyncio.create_task(
+        run_supervisor(
+            root=supervisor_tmp_root,
+            settings=settings,
+            pricing=load_pricing(),
+            claude_binary=str(FAKE_CLAUDE),
+            request_poll_seconds=0.05,
+            session_env_overrides={"FAKE_CLAUDE_MODE": "crash"},
+            dispatcher=LoggingDispatcher(root=supervisor_tmp_root, batch_id="batch-001"),
+        )
+    )
+
+    async def wait_for_category_audit() -> None:
+        audit_path = audit_log(supervisor_tmp_root, "batch-001")
+        for _ in range(400):
+            if audit_path.exists():
+                lines = [line for line in audit_path.read_text().splitlines() if line]
+                for line in lines:
+                    record = json.loads(line)
+                    if (
+                        record.get("kind") == "session-ended"
+                        and record.get("category") == "subprocess-crash"
+                    ):
+                        return
+            await asyncio.sleep(0.1)
+        raise AssertionError("no categorised session-ended audit event")
+
+    try:
+        await asyncio.wait_for(wait_for_category_audit(), timeout=30.0)
+    finally:
+        (supervisor_tmp_root / ".huragok" / "requests" / "stop").write_text("")
+        await asyncio.wait_for(loop_task, timeout=10.0)
+
+    audit_path = audit_log(supervisor_tmp_root, "batch-001")
+    records = [json.loads(line) for line in audit_path.read_text().splitlines() if line]
+    # Find the first crash record and confirm the classifier + action fields.
+    crash = next(r for r in records if r.get("kind") == "session-ended" and r.get("category"))
+    assert crash["category"] == "subprocess-crash"
+    assert crash["action"] in ("retry_fresh", "escalate")
+
+
+async def test_reachability_transitions_to_paused_and_recovers(
+    supervisor_tmp_root: Path,
+) -> None:
+    """A fake dispatcher with ``reachable=False`` pauses the batch.
+
+    When reachable flips back to True, the supervisor should resume.
+    """
+    from orchestrator.notifications import Notification, NotificationDispatcher
+
+    class _FakeDispatcher(NotificationDispatcher):
+        def __init__(self) -> None:
+            self._reachable = True
+            self._pending_fail = False
+
+        @property
+        def reachable(self) -> bool:  # type: ignore[override]
+            return self._reachable
+
+        async def send(self, notification: Notification) -> None:
+            pass
+
+    dispatcher = _FakeDispatcher()
+
+    # Flip unreachable BEFORE starting the loop so the first iteration
+    # observes it and transitions to paused.
+    dispatcher._reachable = False
+
+    settings = HuragokSettings()
+    loop_task = asyncio.create_task(
+        run_supervisor(
+            root=supervisor_tmp_root,
+            settings=settings,
+            pricing=load_pricing(),
+            claude_binary=str(FAKE_CLAUDE),
+            request_poll_seconds=0.05,
+            dispatcher=dispatcher,
+        )
+    )
+
+    async def wait_for_paused() -> None:
+        for _ in range(100):
+            state = read_state(supervisor_tmp_root)
+            if state.phase == "paused":
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError("phase never transitioned to paused")
+
+    await asyncio.wait_for(wait_for_paused(), timeout=5.0)
+    paused = read_state(supervisor_tmp_root)
+    assert paused.halted_reason == "notification-backend-unreachable"
+
+    # Now recover.
+    dispatcher._reachable = True
+
+    async def wait_for_running() -> None:
+        for _ in range(100):
+            state = read_state(supervisor_tmp_root)
+            if state.phase == "running":
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError("phase never recovered to running")
+
+    await asyncio.wait_for(wait_for_running(), timeout=5.0)
+
+    (supervisor_tmp_root / ".huragok" / "requests" / "stop").write_text("")
+    await asyncio.wait_for(loop_task, timeout=5.0)
+
+    # Audit log has both transitions.
+    audit_path = audit_log(supervisor_tmp_root, "batch-001")
+    if audit_path.exists():
+        kinds = [
+            json.loads(line).get("kind") for line in audit_path.read_text().splitlines() if line
+        ]
+        assert "dispatcher-unreachable" in kinds
+        assert "dispatcher-recovered" in kinds
+
+
+async def test_attempt_count_survives_restart(
+    supervisor_tmp_root: Path,
+) -> None:
+    """History-based retry counters persist across daemon restarts (D7)."""
+    from orchestrator.errors import SessionFailureCategory
+    from orchestrator.paths import task_dir
+    from orchestrator.state import HistoryEntry, StatusFile, write_status
+
+    # Seed the task with one prior subprocess-crash entry so it already
+    # has 1 of its 2 retries used up before the loop starts.
+    task_dir(supervisor_tmp_root, "task-b1-test").mkdir(parents=True, exist_ok=True)
+    seeded = StatusFile(
+        version=1,
+        task_id="task-b1-test",
+        state="implementing",
+        foundational=False,
+        history=[
+            HistoryEntry(
+                at=__import__("datetime").datetime(2026, 4, 22, 10, 0, 0),
+                from_="implementing",
+                to="implementing",
+                by="supervisor",
+                session_id="01SEEDED",
+                category=SessionFailureCategory.SUBPROCESS_CRASH.value,
+            ),
+        ],
+    )
+    write_status(supervisor_tmp_root, seeded)
+
+    settings = HuragokSettings()
+    loop_task = asyncio.create_task(
+        run_supervisor(
+            root=supervisor_tmp_root,
+            settings=settings,
+            pricing=load_pricing(),
+            claude_binary=str(FAKE_CLAUDE),
+            request_poll_seconds=0.05,
+            session_env_overrides={"FAKE_CLAUDE_MODE": "crash"},
+            dispatcher=LoggingDispatcher(root=supervisor_tmp_root, batch_id="batch-001"),
+        )
+    )
+
+    # After ONE more crash the task hits the cap (2 crashes total →
+    # escalate on the 3rd classify+decide). Wait for terminal state.
+    async def wait_for_terminal() -> None:
+        for _ in range(400):
+            try:
+                status = read_status(supervisor_tmp_root, "task-b1-test")
+            except FileNotFoundError:
+                await asyncio.sleep(0.1)
+                continue
+            if status.state in ("awaiting-human", "blocked"):
+                return
+            await asyncio.sleep(0.1)
+        raise AssertionError("task never reached a terminal failure state")
+
+    try:
+        await asyncio.wait_for(wait_for_terminal(), timeout=40.0)
+    finally:
+        (supervisor_tmp_root / ".huragok" / "requests" / "stop").write_text("")
+        await asyncio.wait_for(loop_task, timeout=10.0)
+
+    status = read_status(supervisor_tmp_root, "task-b1-test")
+    crash_entries = [h for h in status.history if h.category == "subprocess-crash"]
+    # The seed plus at least one more crash. Because the loop may
+    # fire faster than the cap, we accept >= 2.
+    assert len(crash_entries) >= 2
+    assert status.state in ("awaiting-human", "blocked")

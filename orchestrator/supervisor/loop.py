@@ -17,7 +17,7 @@ import contextlib
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -34,10 +34,28 @@ from orchestrator.budget import (
 from orchestrator.budget.pricing import ensure_models_priced
 from orchestrator.config import HuragokSettings
 from orchestrator.constants import MIN_CLAUDE_CODE_VERSION
-from orchestrator.notifications import LoggingDispatcher, Notification, NotificationDispatcher
-from orchestrator.paths import daemon_pid_file, task_dir
+from orchestrator.errors import (
+    CATEGORIES_COUNTING_ATTEMPTS,
+    NETWORK_CATEGORY,
+    ClassificationContext,
+    RetryAction,
+    SessionFailureCategory,
+    classify,
+    count_attempts,
+    decide_action,
+    jitter_backoff,
+)
+from orchestrator.logging_setup import close_file_sink, configure_logging
+from orchestrator.notifications import (
+    LoggingDispatcher,
+    Notification,
+    NotificationDispatcher,
+    TelegramDispatcher,
+)
+from orchestrator.paths import batch_log, daemon_pid_file, task_dir
 from orchestrator.session import BudgetEvent, SessionResult, run_session
 from orchestrator.state import (
+    AwaitingReply,
     HistoryEntry,
     SessionBudget,
     StateFile,
@@ -52,6 +70,7 @@ from orchestrator.state import (
 )
 from orchestrator.supervisor.sd_notify import sd_notify
 from orchestrator.supervisor.signals import (
+    ParsedRequest,
     SignalState,
     install_signal_handlers,
     process_request_files,
@@ -59,16 +78,23 @@ from orchestrator.supervisor.signals import (
 )
 
 __all__ = [
+    "DEFAULT_REACHABILITY_POLL_SECONDS",
     "DEFAULT_REQUEST_POLL_SECONDS",
     "ROLE_FOR_STATE",
     "SessionAttempt",
     "SupervisorContext",
+    "build_dispatcher",
     "run",
     "run_supervisor",
 ]
 
 
 DEFAULT_REQUEST_POLL_SECONDS: float = 1.5
+
+# How often the main loop checks the dispatcher's reachable state to
+# decide whether to transition in/out of ``paused``. One second is a
+# rounding error compared to the 10-minute grace window.
+DEFAULT_REACHABILITY_POLL_SECONDS: float = 1.0
 
 # ADR-0003 D1: role chosen by the Supervisor from the current status.state.
 # ``None`` indicates a non-session state (terminal or waiting on operator).
@@ -93,11 +119,6 @@ MODEL_FOR_ROLE: dict[str, str] = {
     "documenter": "claude-haiku-4-5-20251001",
 }
 
-# B1's simplified retry rule: two consecutive dirty ends on a task move it
-# to ``blocked``. ADR-0002 D7's full taxonomy and per-category caps are
-# B2's job.
-DIRTY_END_CAP: int = 2
-
 # Version check: claude --version produces output like "2.1.91 (Claude Code)".
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
@@ -109,10 +130,17 @@ _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 @dataclass(slots=True)
 class SessionAttempt:
-    """One row of the in-memory retry counter keyed by task id."""
+    """In-memory per-task attempt caches, recomputed from history on demand.
+
+    B2 moved the durable counters into ``status.yaml.history`` so they
+    survive daemon restarts (ADR-0002 D7). This dataclass still exists
+    as a convenience so ``_post_session`` can bundle the two numbers it
+    just computed without re-walking history later in the same tick.
+    """
 
     task_id: str
-    consecutive_dirty: int = 0
+    fresh_retry_count: int = 0
+    network_retry_count: int = 0
 
 
 @dataclass(slots=True)
@@ -132,12 +160,16 @@ class SupervisorContext:
     signal_state: SignalState
     event_queue: asyncio.Queue[BudgetEvent]
     claude_binary: str
-    attempts: dict[str, SessionAttempt]
+    attempts: dict[str, SessionAttempt] = field(default_factory=dict)
     request_poll_seconds: float = DEFAULT_REQUEST_POLL_SECONDS
     # Extra env vars to merge onto each session's scrubbed env. Tests use
     # this to pass FAKE_CLAUDE_MODE through without polluting the default
     # inherit allowlist.
     session_env_overrides: dict[str, str] | None = None
+    # Backoff suppression hook — tests use this to shortcut multi-second
+    # sleeps. Defaults to the real ``asyncio.wait_for(stop_event, t)``
+    # behaviour through :func:`sleep_or_shutdown` when ``None``.
+    backoff_sleeper: object = None
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +238,7 @@ async def run_supervisor(
     request_poll_seconds: float = DEFAULT_REQUEST_POLL_SECONDS,
     session_env_overrides: dict[str, str] | None = None,
     rate_limit_window_cap: int | None = None,
+    dispatcher: NotificationDispatcher | None = None,
 ) -> int:
     """Run the main loop given an already-validated pricing table.
 
@@ -224,7 +257,19 @@ async def run_supervisor(
         rate_limit = RateLimitLog(root, window_cap=rate_limit_window_cap)
     rate_limit.load()
 
-    dispatcher = LoggingDispatcher(root=root, batch_id=_peek_batch_id(root))
+    batch_id = _peek_batch_id(root)
+    # ADR-0002 D9: mirror JSON records to `.huragok/logs/batch-<id>.jsonl`
+    # so `huragok logs` has something to tail without the operator
+    # redirecting stdout themselves. No-op when there is no active batch
+    # yet (the sink gets installed the first time a run starts against a
+    # submitted batch).
+    if batch_id is not None:
+        configure_logging(
+            level=settings.log_level,
+            file_path=batch_log(root, batch_id),
+        )
+    if dispatcher is None:
+        dispatcher = build_dispatcher(settings=settings, root=root, batch_id=batch_id)
 
     admin_key = (
         settings.anthropic_admin_api_key.get_secret_value()
@@ -263,7 +308,6 @@ async def run_supervisor(
         signal_state=signal_state,
         event_queue=event_queue,
         claude_binary=claude_binary,
-        attempts={},
         request_poll_seconds=request_poll_seconds,
         session_env_overrides=dict(session_env_overrides) if session_env_overrides else None,
     )
@@ -283,6 +327,10 @@ async def run_supervisor(
         # Wait for the long-lived coroutines to exit. Both are designed
         # to drain cleanly when the stop event fires.
         await asyncio.gather(tracker_task, dispatcher_task, return_exceptions=True)
+        # Release the batch-log file handle even when the supervisor
+        # aborts on an exception; leaving it open wedges the fd until
+        # the process itself exits.
+        close_file_sink()
 
     return exit_code
 
@@ -298,8 +346,10 @@ async def _main_loop(ctx: SupervisorContext) -> int:
     idle_ticks = 0
 
     while not ctx.signal_state.shutting_down.is_set():
-        # 1. Drain any stop/halt/reply requests.
-        process_request_files(ctx.root, ctx.signal_state)
+        # 1. Drain any stop/halt/reply requests and forward replies into
+        # state.yaml so downstream helpers can observe operator intent.
+        drained = process_request_files(ctx.root, ctx.signal_state)
+        _apply_drained_requests(ctx, drained)
         if ctx.signal_state.shutting_down.is_set():
             break
 
@@ -314,6 +364,14 @@ async def _main_loop(ctx: SupervisorContext) -> int:
         if state.phase in ("halted", "complete"):
             log.info("supervisor.phase.terminal", phase=state.phase)
             break
+
+        # 2b. Reconcile dispatcher reachability with the state-machine
+        # phase. An unreachable dispatcher with an outstanding
+        # notification pauses launches; recovery resumes them.
+        state = _reconcile_reachability(ctx, state)
+        if state.phase == "paused" and state.halted_reason == _NOTIFICATION_UNREACHABLE_REASON:
+            await sleep_or_shutdown(ctx.signal_state, DEFAULT_REACHABILITY_POLL_SECONDS)
+            continue
 
         # 3. Budget / halt-after-session gating.
         if ctx.tracker.over_budget():
@@ -467,17 +525,39 @@ async def _post_session(
     session_id: str,
     result: SessionResult,
 ) -> None:
-    """Apply the session outcome to on-disk state and retry counters."""
+    """Apply the session outcome to on-disk state using the D7 taxonomy.
+
+    Pipeline per ADR-0002 D7:
+
+    1. Classify the session result into one of seven categories.
+    2. Count prior attempts of the same "retry family" from
+       ``status.yaml.history``.
+    3. Ask :func:`decide_action` what to do next.
+    4. Apply that action — advance / retry fresh / backoff / halt /
+       escalate — with appropriate state transitions, history entries,
+       and audit events.
+    """
     log = structlog.get_logger(__name__).bind(component="supervisor")
     batch_id = state.batch_id
     now = datetime.now(UTC)
 
-    attempt = ctx.attempts.setdefault(task.task_id, SessionAttempt(task_id=task.task_id))
+    context = ClassificationContext.from_result(result)
+    category = classify(result, context)
 
-    if result.end_state == "clean":
-        attempt.consecutive_dirty = 0
-    else:
-        attempt.consecutive_dirty += 1
+    # Attempt counts come from history on disk, not an in-memory cache.
+    try:
+        fresh_task = read_status(ctx.root, task.task_id)
+    except FileNotFoundError:
+        fresh_task = task
+    fresh_retry_count = count_attempts(fresh_task.history, CATEGORIES_COUNTING_ATTEMPTS)
+    network_retry_count = count_attempts(fresh_task.history, {NETWORK_CATEGORY})
+    attempt_count = _attempts_for_category(category, fresh_retry_count, network_retry_count)
+
+    action = decide_action(
+        category,
+        attempt_count,
+        retry_after=context.retry_after_seconds,
+    )
 
     if batch_id is not None:
         append_audit(
@@ -490,8 +570,11 @@ async def _post_session(
                 "role": role,
                 "session_id": session_id,
                 "end_state": result.end_state,
+                "category": category.value,
                 "exit_code": result.exit_code,
                 "duration_seconds": result.duration_seconds,
+                "attempt_count": attempt_count,
+                "action": action.kind,
             },
         )
 
@@ -501,49 +584,174 @@ async def _post_session(
         role=role,
         session_id=session_id,
         end_state=result.end_state,
-        consecutive_dirty=attempt.consecutive_dirty,
+        category=category.value,
+        attempt_count=attempt_count,
+        action=action.kind,
     )
 
-    # B1 retry cap: two consecutive dirty ends transitions the task to
-    # blocked. The full seven-category D7 taxonomy is B2.
-    if attempt.consecutive_dirty >= DIRTY_END_CAP:
-        await _block_task(ctx, state, task, session_id, result.end_state)
-        return
+    # Cache for diagnostics; not authoritative.
+    ctx.attempts[task.task_id] = SessionAttempt(
+        task_id=task.task_id,
+        fresh_retry_count=fresh_retry_count,
+        network_retry_count=network_retry_count,
+    )
 
-    # Freshly re-read status.yaml so that any in-session agent-initiated
-    # transition is respected. The supervisor only modifies status on
-    # failure or terminal-state advancement - the agent owns the happy
-    # path (ADR-0003 D2).
-    with contextlib.suppress(FileNotFoundError):
-        task = read_status(ctx.root, task.task_id)
+    await _apply_retry_action(
+        ctx,
+        state=state,
+        task=fresh_task,
+        role=role,
+        session_id=session_id,
+        category=category,
+        action=action,
+        result=result,
+    )
 
 
-async def _block_task(
+def _attempts_for_category(
+    category: SessionFailureCategory,
+    fresh_retry_count: int,
+    network_retry_count: int,
+) -> int:
+    """Pick the right counter per D7's per-category caps."""
+    if category == SessionFailureCategory.TRANSIENT_NETWORK:
+        return network_retry_count
+    if category in (
+        SessionFailureCategory.SESSION_TIMEOUT,
+        SessionFailureCategory.SUBPROCESS_CRASH,
+    ):
+        return fresh_retry_count
+    return 0
+
+
+async def _apply_retry_action(
     ctx: SupervisorContext,
+    *,
     state: StateFile,
     task: StatusFile,
+    role: str,
     session_id: str,
-    end_state: str,
+    category: SessionFailureCategory,
+    action: RetryAction,
+    result: SessionResult,
 ) -> None:
-    """Mark ``task`` blocked after the retry cap is hit."""
+    """Dispatch on :class:`RetryAction` kind and update state / history."""
     log = structlog.get_logger(__name__).bind(component="supervisor")
-    now = datetime.now(UTC)
-    blocker = f"auto-blocked after {DIRTY_END_CAP} consecutive {end_state} session(s)"
 
-    task.history.append(
-        HistoryEntry(
-            at=now,
+    if action.kind == "advance":
+        # Clean end. Re-read the status to honour any agent-driven
+        # transition that already fired; the supervisor doesn't mutate
+        # on the happy path (ADR-0003 D2).
+        with contextlib.suppress(FileNotFoundError):
+            _ = read_status(ctx.root, task.task_id)
+        return
+
+    if action.kind == "backoff":
+        delay = action.backoff_seconds or 0.0
+        if category == SessionFailureCategory.TRANSIENT_NETWORK:
+            # Per-call jitter (0-25%) so synchronised retries don't
+            # stampede a recovering endpoint.
+            delay = jitter_backoff(delay)
+        _append_history(
+            task,
             from_=task.state,
-            to="blocked",
-            by="supervisor",
+            to=task.state,
+            category=category.value,
             session_id=session_id,
         )
+        write_status(ctx.root, task)
+        await _audit_retry(ctx, state, task, session_id, category, action, delay)
+        log.info(
+            "supervisor.retry.backoff",
+            task_id=task.task_id,
+            category=category.value,
+            seconds=round(delay, 3),
+        )
+        await sleep_or_shutdown(ctx.signal_state, delay)
+        return
+
+    if action.kind == "retry_fresh":
+        _append_history(
+            task,
+            from_=task.state,
+            to=task.state,
+            category=category.value,
+            session_id=session_id,
+        )
+        write_status(ctx.root, task)
+        await _audit_retry(ctx, state, task, session_id, category, action, None)
+        log.info(
+            "supervisor.retry.fresh",
+            task_id=task.task_id,
+            category=category.value,
+        )
+        return
+
+    if action.kind == "escalate":
+        await _escalate_task(
+            ctx,
+            state=state,
+            task=task,
+            role=role,
+            session_id=session_id,
+            category=category,
+            result=result,
+        )
+        return
+
+    if action.kind == "halt":
+        await _halt_for_category(
+            ctx,
+            state=state,
+            task=task,
+            session_id=session_id,
+            category=category,
+            result=result,
+        )
+        return
+
+    # retry_same — unused in Phase 1 (rate-limited uses backoff) but
+    # kept in the taxonomy for symmetry with ADR-0002 D7. Treat as
+    # retry_fresh.
+    if action.kind == "retry_same":
+        _append_history(
+            task,
+            from_=task.state,
+            to=task.state,
+            category=category.value,
+            session_id=session_id,
+        )
+        write_status(ctx.root, task)
+        await _audit_retry(ctx, state, task, session_id, category, action, None)
+        return
+
+
+async def _escalate_task(
+    ctx: SupervisorContext,
+    *,
+    state: StateFile,
+    task: StatusFile,
+    role: str,
+    session_id: str,
+    category: SessionFailureCategory,
+    result: SessionResult,
+) -> None:
+    """Escalate to the operator: transition to awaiting-human + notify."""
+    log = structlog.get_logger(__name__).bind(component="supervisor")
+    now = datetime.now(UTC)
+
+    _append_history(
+        task,
+        from_=task.state,
+        to="awaiting-human",
+        category=category.value,
+        session_id=session_id,
     )
-    task.state = "blocked"
+    task.state = "awaiting-human"
+    blocker = f"escalated after cap hit for {category.value}"
     if blocker not in task.blockers:
         task.blockers.append(blocker)
     write_status(ctx.root, task)
-    log.warning("supervisor.task.blocked", task_id=task.task_id, reason=blocker)
 
     if state.batch_id is not None:
         append_audit(
@@ -551,20 +759,155 @@ async def _block_task(
             state.batch_id,
             {
                 "ts": now.isoformat(),
-                "kind": "task-blocked",
+                "kind": "task-escalated",
                 "task_id": task.task_id,
                 "session_id": session_id,
-                "reason": blocker,
+                "category": category.value,
+                "role": role,
             },
         )
 
+    log.warning(
+        "supervisor.task.escalated",
+        task_id=task.task_id,
+        category=category.value,
+    )
+
     notification = Notification.make(
         kind="blocker",
-        summary=f"task {task.task_id} auto-blocked: {blocker}",
-        reply_verbs=["iterate", "stop", "escalate"],
-        metadata={"task_id": task.task_id, "session_id": session_id},
+        summary=_escalation_summary(task, category, result),
+        reply_verbs=["continue", "iterate", "stop", "escalate"],
+        metadata={
+            "task_id": task.task_id,
+            "session_id": session_id,
+            "category": category.value,
+        },
     )
     await ctx.dispatcher.send(notification)
+    _set_awaiting_reply(ctx, state, notification)
+
+
+async def _halt_for_category(
+    ctx: SupervisorContext,
+    *,
+    state: StateFile,
+    task: StatusFile,
+    session_id: str,
+    category: SessionFailureCategory,
+    result: SessionResult,
+) -> None:
+    """Halt the batch for an unrecoverable category (context-overflow / unknown)."""
+    log = structlog.get_logger(__name__).bind(component="supervisor")
+
+    _append_history(
+        task,
+        from_=task.state,
+        to="blocked",
+        category=category.value,
+        session_id=session_id,
+    )
+    task.state = "blocked"
+    blocker = f"halt: {category.value}"
+    if blocker not in task.blockers:
+        task.blockers.append(blocker)
+    write_status(ctx.root, task)
+
+    notification = Notification.make(
+        kind="blocker",
+        summary=_escalation_summary(task, category, result),
+        reply_verbs=["iterate", "stop", "escalate"],
+        metadata={
+            "task_id": task.task_id,
+            "session_id": session_id,
+            "category": category.value,
+        },
+    )
+    await ctx.dispatcher.send(notification)
+    _set_awaiting_reply(ctx, state, notification)
+
+    _transition_to_halted(ctx, state, reason=f"halt-{category.value}")
+    log.warning(
+        "supervisor.halted.category",
+        task_id=task.task_id,
+        category=category.value,
+    )
+
+
+def _escalation_summary(
+    task: StatusFile,
+    category: SessionFailureCategory,
+    result: SessionResult,
+) -> str:
+    """Short operator-facing summary for escalation / halt notifications."""
+    tail = " ".join(result.stderr_tail[-3:]) if result.stderr_tail else ""
+    tail = tail.strip().replace("\n", " ")
+    if len(tail) > 160:
+        tail = tail[:157] + "..."
+    body = f"task {task.task_id} — {category.value}"
+    if tail:
+        body += f" — {tail}"
+    return body
+
+
+def _append_history(
+    task: StatusFile,
+    *,
+    from_: str,
+    to: str,
+    category: str | None,
+    session_id: str | None,
+) -> None:
+    task.history.append(
+        HistoryEntry(
+            at=datetime.now(UTC),
+            from_=from_,
+            to=to,
+            by="supervisor",
+            session_id=session_id,
+            category=category,
+        )
+    )
+
+
+async def _audit_retry(
+    ctx: SupervisorContext,
+    state: StateFile,
+    task: StatusFile,
+    session_id: str,
+    category: SessionFailureCategory,
+    action: RetryAction,
+    backoff_seconds: float | None,
+) -> None:
+    if state.batch_id is None:
+        return
+    append_audit(
+        ctx.root,
+        state.batch_id,
+        {
+            "ts": datetime.now(UTC).isoformat(),
+            "kind": "session-retry",
+            "task_id": task.task_id,
+            "session_id": session_id,
+            "category": category.value,
+            "action": action.kind,
+            "backoff_seconds": backoff_seconds,
+        },
+    )
+
+
+def _set_awaiting_reply(
+    ctx: SupervisorContext,
+    state: StateFile,
+    notification: Notification,
+) -> None:
+    """Record the notification as outstanding in ``state.yaml.awaiting_reply``."""
+    state.awaiting_reply = AwaitingReply(
+        notification_id=notification.id,
+        sent_at=notification.created_at,
+        kind=notification.kind,
+        deadline=None,
+    )
+    write_state(ctx.root, state)
 
 
 def _mark_task_done(ctx: SupervisorContext, task: StatusFile) -> None:
@@ -754,3 +1097,240 @@ class _BudgetRef:
 
 # Type alias for backwards readability.
 Phase = Literal["idle", "running", "paused", "halted", "complete"]
+
+
+# ---------------------------------------------------------------------------
+# Reachability reconciliation (ADR-0002 D6 closing paragraph).
+# ---------------------------------------------------------------------------
+
+
+_NOTIFICATION_UNREACHABLE_REASON: str = "notification-backend-unreachable"
+
+
+def _reconcile_reachability(ctx: SupervisorContext, state: StateFile) -> StateFile:
+    """Flip ``state.phase`` between paused and running based on dispatcher health.
+
+    The dispatcher's ``reachable`` property implements the "outstanding
+    notification + 10m of failures on both directions" rule; this
+    helper translates that into a durable phase transition and the
+    matching audit events. Returns the (possibly updated) state object.
+    """
+    log = structlog.get_logger(__name__).bind(component="supervisor")
+    reachable_prop = getattr(ctx.dispatcher, "reachable", True)
+    # ``reachable`` may be a property (Telegram) or a plain attribute.
+    reachable = bool(reachable_prop() if callable(reachable_prop) else reachable_prop)
+
+    if not reachable and state.phase in ("idle", "running"):
+        state.phase = "paused"
+        state.halted_reason = _NOTIFICATION_UNREACHABLE_REASON
+        state.last_checkpoint = datetime.now(UTC)
+        write_state(ctx.root, state)
+        log.critical(
+            "supervisor.dispatcher.unreachable",
+            reason=_NOTIFICATION_UNREACHABLE_REASON,
+        )
+        if state.batch_id is not None:
+            append_audit(
+                ctx.root,
+                state.batch_id,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "kind": "dispatcher-unreachable",
+                    "reason": _NOTIFICATION_UNREACHABLE_REASON,
+                },
+            )
+        return state
+
+    if reachable and (
+        state.phase == "paused" and state.halted_reason == _NOTIFICATION_UNREACHABLE_REASON
+    ):
+        state.phase = "running"
+        state.halted_reason = None
+        state.last_checkpoint = datetime.now(UTC)
+        write_state(ctx.root, state)
+        log.warning("supervisor.dispatcher.recovered")
+        if state.batch_id is not None:
+            append_audit(
+                ctx.root,
+                state.batch_id,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "kind": "dispatcher-recovered",
+                },
+            )
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Reply-request application (inbound from dispatcher / CLI).
+# ---------------------------------------------------------------------------
+
+
+def _apply_drained_requests(
+    ctx: SupervisorContext,
+    drained: list[ParsedRequest],
+) -> None:
+    """Apply ``reply-<id>.yaml`` payloads to ``state.yaml.awaiting_reply``.
+
+    Stop / halt markers were already applied by
+    :func:`process_request_files`; here we just handle replies. A reply
+    whose ``notification_id`` matches the current awaiting-reply entry
+    clears it; non-matching replies are kept as a diagnostic audit
+    entry but don't override state.
+    """
+    replies = [r for r in drained if r.kind == "reply"]
+    if not replies:
+        return
+    log = structlog.get_logger(__name__).bind(component="supervisor")
+    try:
+        state = read_state(ctx.root)
+    except FileNotFoundError:
+        return
+
+    changed = False
+    for reply in replies:
+        notification_id = reply.payload.get("notification_id")
+        verb = reply.payload.get("verb")
+        annotation = reply.payload.get("annotation")
+        source = reply.payload.get("source", "unknown")
+
+        log.info(
+            "supervisor.reply.received",
+            notification_id=notification_id,
+            verb=verb,
+            source=source,
+        )
+        if state.batch_id is not None:
+            append_audit(
+                ctx.root,
+                state.batch_id,
+                {
+                    "ts": datetime.now(UTC).isoformat(),
+                    "kind": "notification-reply-applied",
+                    "notification_id": notification_id,
+                    "verb": verb,
+                    "annotation": annotation,
+                    "source": source,
+                },
+            )
+        awaiting = state.awaiting_reply.notification_id
+        if awaiting is not None and awaiting == notification_id:
+            state.awaiting_reply = AwaitingReply()
+            changed = True
+            if verb == "stop":
+                ctx.signal_state.shutting_down.set()
+            elif verb == "iterate":
+                # ADR-0002 D7: iterate resets attempt counters. We
+                # achieve this by truncating history entries whose
+                # category is in the counted set on the matching task.
+                task_id = reply.payload.get("task_id") or ctx.attempts.keys()
+                _reset_task_retry_counters(ctx, state, task_id)
+            elif verb == "escalate":
+                # Task already in awaiting-human if the escalation was
+                # automatic; if it's operator-initiated, mark it so the
+                # operator can drive a live session next.
+                pass
+            elif verb == "continue":
+                # Advance past the failure. Restore task state from
+                # awaiting-human back to the role's "next" state.
+                _resume_task_after_continue(ctx, state, reply.payload)
+    if changed:
+        write_state(ctx.root, state)
+
+
+def _reset_task_retry_counters(
+    ctx: SupervisorContext,
+    state: StateFile,
+    task_id: object,
+) -> None:
+    """Clear the ``category``-annotated history rows for a task on ``iterate``."""
+    if isinstance(task_id, str):
+        targets = [task_id]
+    elif task_id is None:
+        return
+    else:
+        targets = list(task_id) if isinstance(task_id, list | tuple | set) else []
+        if not targets and state.current_task is not None:
+            targets = [state.current_task]
+    for t in targets:
+        try:
+            status = read_status(ctx.root, t)
+        except FileNotFoundError:
+            continue
+        status.history = [h for h in status.history if h.category is None]
+        status.blockers = []
+        if status.state in ("awaiting-human", "blocked"):
+            # Return to the role-appropriate state. The simplest rule
+            # is to hand back to the Implementer — that matches D7's
+            # "reset task state and try fresh" semantics.
+            status.state = "implementing"
+        write_status(ctx.root, status)
+
+
+def _resume_task_after_continue(
+    ctx: SupervisorContext,
+    state: StateFile,
+    payload: dict[str, object],
+) -> None:
+    """Advance a task past the failure when the operator replies ``continue``."""
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) and state.current_task is not None:
+        task_id = state.current_task
+    if not isinstance(task_id, str):
+        return
+    try:
+        status = read_status(ctx.root, task_id)
+    except FileNotFoundError:
+        return
+    # Operator override: drop the escalation-era blockers and move the
+    # task forward to the state implied by the last observed role. If
+    # we can't tell, default to implementing so the pipeline continues.
+    if status.state in ("awaiting-human", "blocked"):
+        status.state = "implementing"
+        status.blockers = []
+        status.history.append(
+            HistoryEntry(
+                at=datetime.now(UTC),
+                from_=status.state,
+                to="implementing",
+                by="operator",
+                session_id=None,
+                category="operator-override",
+            )
+        )
+    write_status(ctx.root, status)
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher factory.
+# ---------------------------------------------------------------------------
+
+
+def build_dispatcher(
+    *,
+    settings: HuragokSettings,
+    root: Path,
+    batch_id: str | None,
+) -> NotificationDispatcher:
+    """Build the notification dispatcher for the current daemon run.
+
+    Returns a :class:`TelegramDispatcher` when ``TELEGRAM_BOT_TOKEN``
+    is configured; otherwise a :class:`LoggingDispatcher` that still
+    appends to the per-batch audit log. The choice is made once per
+    daemon invocation — changing ``.env`` mid-run requires a restart.
+    """
+    log = structlog.get_logger(__name__).bind(component="supervisor")
+    if settings.telegram_bot_token is None or not settings.telegram_default_chat_id:
+        if settings.telegram_bot_token is not None and not settings.telegram_default_chat_id:
+            log.warning(
+                "supervisor.dispatcher.telegram_missing_chat_id",
+                hint="set HURAGOK_TELEGRAM_DEFAULT_CHAT_ID to enable Telegram",
+            )
+        return LoggingDispatcher(root=root, batch_id=batch_id)
+    log.info("supervisor.dispatcher.telegram_enabled")
+    return TelegramDispatcher(
+        bot_token=settings.telegram_bot_token,
+        default_chat_id=settings.telegram_default_chat_id,
+        root=root,
+        batch_id=batch_id,
+    )

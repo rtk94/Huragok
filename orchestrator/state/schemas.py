@@ -180,6 +180,13 @@ class HistoryEntry(BaseModel):
     # ADR-0003 can evolve the allowed roles without invalidating old history.
     by: str
     session_id: str | None = None
+    # B2: the D7 failure category (see ``orchestrator.errors``) that drove
+    # this transition, if any. ``None`` for agent-driven happy-path
+    # transitions (e.g. Architect → implementing). Populated by the
+    # Supervisor when a session-level failure forces a retry / halt /
+    # escalate. Kept as ``str`` so history can round-trip through older
+    # daemons and future category renames without hard-failing validation.
+    category: str | None = None
 
 
 class UIReview(BaseModel):

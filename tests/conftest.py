@@ -57,3 +57,30 @@ def _clear_settings_cache() -> Iterator[None]:
     load_settings.cache_clear()
     yield
     load_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_external_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset env vars and disable ``.env`` loading for tests.
+
+    The user's working-directory ``.env`` can set ``TELEGRAM_BOT_TOKEN``
+    and ``HURAGOK_TELEGRAM_DEFAULT_CHAT_ID``; if either leaks into a
+    test that exercises the supervisor, ``build_dispatcher`` constructs
+    a real :class:`TelegramDispatcher` whose ``getUpdates`` long-poll
+    blocks on the real network. We scrub both the live environment
+    *and* the settings config so tests get a deterministic, offline
+    view regardless of where they're run from. Tests that want to
+    exercise Telegram construct a :class:`TelegramDispatcher` directly
+    with an injected mock client.
+    """
+    from orchestrator.config import HuragokSettings
+
+    for key in (
+        "TELEGRAM_BOT_TOKEN",
+        "HURAGOK_TELEGRAM_DEFAULT_CHAT_ID",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_ADMIN_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    # Disable `.env` discovery so tests never pick up an ambient dev file.
+    monkeypatch.setitem(HuragokSettings.model_config, "env_file", None)

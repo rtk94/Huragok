@@ -11,6 +11,7 @@ from orchestrator.supervisor.loop import (
     ROLE_FOR_STATE,
     SessionAttempt,
     SupervisorContext,
+    build_dispatcher,
     run,
     run_supervisor,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "SessionAttempt",
     "SignalState",
     "SupervisorContext",
+    "build_dispatcher",
     "install_signal_handlers",
     "process_request_files",
     "run",

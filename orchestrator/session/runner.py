@@ -14,15 +14,16 @@ import os
 import signal
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 
 from orchestrator.session.events import BudgetEvent, SessionContext
 from orchestrator.session.stream import (
+    AssistantEvent,
     ResultEvent,
     StreamParseError,
     UserEvent,
@@ -57,6 +58,11 @@ _GRACE_PERIOD_SECONDS: int = 30
 # Stderr tail buffer size, in lines.
 _STDERR_TAIL_LINES: int = 50
 
+# Ring-buffer size of raw stream events retained on the SessionResult so
+# the D7 classifier has enough signal to distinguish context-overflow,
+# transient-network, subprocess-crash, and unknown from one another.
+_LAST_EVENTS_BUFFER: int = 5
+
 # Env vars that are safe to inherit from the parent process. Everything
 # else is scrubbed. Narrow list by design — subprocess envs should be
 # deterministic, not an accident of whatever spawned the daemon.
@@ -81,7 +87,15 @@ _INHERIT_ENV_KEYS: frozenset[str] = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class SessionResult:
-    """Outcome of one session, returned by :func:`run_session`."""
+    """Outcome of one session, returned by :func:`run_session`.
+
+    B2 extends the B1 contract with two classifier-facing fields
+    (``last_events`` and ``last_assistant_stop_reason``) so the D7
+    taxonomy classifier has enough signal to distinguish
+    context-overflow, transient-network, subprocess-crash, and unknown
+    without reshaping ``ResultEvent``. The pre-existing fields are
+    untouched; callers built against B1 continue to work.
+    """
 
     session_id: str
     end_state: Literal["clean", "dirty", "timeout", "rate-limited"]
@@ -89,6 +103,17 @@ class SessionResult:
     result_event: ResultEvent | None
     stderr_tail: list[str]
     duration_seconds: float
+    # The last few raw stream-event dicts, in arrival order. Used by the
+    # D7 classifier (``orchestrator.errors.classify``) to look for
+    # stop-reason / overflow / 429 markers without having to run the
+    # parser again. Kept as raw dicts so unrecognised new fields from
+    # future Claude Code releases still reach the classifier untouched.
+    last_events: list[dict[str, Any]] = field(default_factory=list)
+    # ``stop_reason`` extracted from the most recent assistant event or
+    # the terminal result event, whichever is more recent. ``None`` if
+    # no such signal was observed. Context-overflow typically surfaces
+    # here as ``"max_tokens"`` or a free-form marker in the raw event.
+    last_assistant_stop_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +207,11 @@ async def run_session(
         return result
 
     stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
+    last_events: deque[dict[str, Any]] = deque(maxlen=_LAST_EVENTS_BUFFER)
     terminal_result: list[ResultEvent] = []
     rate_limited: list[bool] = [False]
     saw_user_error: list[bool] = [False]
+    last_stop_reason: list[str | None] = [None]
 
     pump_tasks = [
         asyncio.create_task(
@@ -195,6 +222,8 @@ async def run_session(
                 terminal_result=terminal_result,
                 rate_limited=rate_limited,
                 saw_user_error=saw_user_error,
+                last_events=last_events,
+                last_stop_reason=last_stop_reason,
                 log=log,
             )
         ),
@@ -242,6 +271,8 @@ async def run_session(
         result_event=terminal_result[0] if terminal_result else None,
         stderr_tail=stderr_tail_list,
         duration=duration,
+        last_events=list(last_events),
+        last_stop_reason=last_stop_reason[0],
     )
 
     log.info(
@@ -331,6 +362,8 @@ async def _pump_stdout(
     terminal_result: list[ResultEvent],
     rate_limited: list[bool],
     saw_user_error: list[bool],
+    last_events: deque[dict[str, Any]],
+    last_stop_reason: list[str | None],
     log: structlog.stdlib.BoundLogger,
 ) -> None:
     """Read subprocess stdout line-by-line; parse + publish each event."""
@@ -350,10 +383,21 @@ async def _pump_stdout(
             )
             continue
 
+        # Capture the raw dict for the classifier's ring buffer before any
+        # type-specific branching — we want every parseable event included.
+        last_events.append(event.raw)
+
         if isinstance(event, ResultEvent):
             terminal_result.append(event)
             if event.is_error and event.subtype and "rate" in event.subtype.lower():
                 rate_limited[0] = True
+            reason = _extract_stop_reason(event.raw)
+            if reason is not None:
+                last_stop_reason[0] = reason
+        elif isinstance(event, AssistantEvent):
+            reason = _extract_stop_reason(event.raw)
+            if reason is not None:
+                last_stop_reason[0] = reason
         elif isinstance(event, UserEvent) and event.is_error:
             saw_user_error[0] = True
 
@@ -365,6 +409,25 @@ async def _pump_stdout(
                 stream_event=event,
             )
         )
+
+
+def _extract_stop_reason(raw: dict[str, Any]) -> str | None:
+    """Pull ``stop_reason`` from a stream-event raw dict, flat or nested.
+
+    Claude Code's stream-json puts ``stop_reason`` on the terminal
+    ``result`` event's top level in some releases and inside
+    ``message.stop_reason`` on ``assistant`` events in others. We look in
+    both locations and return the first non-empty string we find.
+    """
+    top = raw.get("stop_reason")
+    if isinstance(top, str) and top:
+        return top
+    message = raw.get("message")
+    if isinstance(message, dict):
+        nested = message.get("stop_reason")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
 
 
 async def _drain_stderr(
@@ -435,6 +498,8 @@ def _make_result(
     result_event: ResultEvent | None,
     stderr_tail: list[str],
     duration: float,
+    last_events: list[dict[str, Any]] | None = None,
+    last_stop_reason: str | None = None,
 ) -> SessionResult:
     return SessionResult(
         session_id=session_id,
@@ -443,4 +508,6 @@ def _make_result(
         result_event=result_event,
         stderr_tail=stderr_tail,
         duration_seconds=round(duration, 3),
+        last_events=list(last_events) if last_events is not None else [],
+        last_assistant_stop_reason=last_stop_reason,
     )
